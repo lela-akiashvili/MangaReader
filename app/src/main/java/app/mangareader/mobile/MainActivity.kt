@@ -65,6 +65,9 @@ fun ScraperScreen() {
     var maxChapters by remember { mutableStateOf("3") }
     var showLoginDialog by remember { mutableStateOf(false) }
 
+    // Track the URL inside the WebView dialog
+    var currentDialogUrl by remember { mutableStateOf("") }
+
     // Launcher for selecting output folder
     val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -162,20 +165,40 @@ fun ScraperScreen() {
     if (showLoginDialog) {
         AlertDialog(
             onDismissRequest = { showLoginDialog = false },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            modifier = Modifier.fillMaxWidth(0.95f),
             confirmButton = {
                 Button(onClick = {
                     showLoginDialog = false
-                    ScrapeState.log("Login dialog closed. Cookies saved automatically.")
+                    ScrapeState.log("Browser closed. Cookies saved automatically.")
                 }) { Text("Done") }
             },
-            title = { Text("Login to grab Cookies") },
+            dismissButton = {
+                Button(onClick = {
+                    if (currentDialogUrl.isNotEmpty()) {
+                        url = currentDialogUrl
+                    }
+                    showLoginDialog = false
+                    ScrapeState.log("Grabbed URL: $currentDialogUrl")
+                }) { Text("Use Current URL") }
+            },
+            title = { Text("Login & Browse") },
             text = {
-                Box(modifier = Modifier.fillMaxWidth().height(400.dp)) {
+                Box(modifier = Modifier.fillMaxWidth().height(500.dp)) {
                     AndroidView(factory = { ctx ->
                         WebView(ctx).apply {
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
-                            webViewClient = WebViewClient()
+
+                            webViewClient = object : WebViewClient() {
+                                // Track the URL as the user clicks links and navigates
+                                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                                    super.doUpdateVisitedHistory(view, url, isReload)
+                                    if (url != null) {
+                                        currentDialogUrl = url
+                                    }
+                                }
+                            }
                             loadUrl("https://www.mangago.me/home/accounts/login/")
                         }
                     })
