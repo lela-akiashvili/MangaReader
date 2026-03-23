@@ -1,21 +1,25 @@
 package app.mangareader.mobile
 
 import android.net.Uri
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 
-/**
- * A simple singleton to share state between the Service (which does the work)
- * and the MainActivity (which shows the UI).
- */
+enum class ConflictAction {
+    OVERWRITE, SKIP, OVERWRITE_ALL, SKIP_ALL
+}
+
 object ScrapeState {
     val isScraping = MutableStateFlow(false)
     val logs = MutableStateFlow<List<String>>(emptyList())
     val outputDirectoryUri = MutableStateFlow<Uri?>(null)
 
+    // UI Interaction states for Folder Conflicts
+    val showConflictDialog = MutableStateFlow<String?>(null)
+    var conflictResolution: CompletableDeferred<ConflictAction>? = null
+
     fun log(message: String) {
-        // Keeps the last 100 logs to prevent memory issues
         val currentLogs = logs.value.toMutableList()
-        currentLogs.add(0, message) // Add to top
+        currentLogs.add(0, message)
         if (currentLogs.size > 100) {
             currentLogs.removeLast()
         }

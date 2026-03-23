@@ -1,11 +1,11 @@
 package app.mangareader.mobile
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -28,12 +28,12 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Request Notification Permission for Android 13+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
@@ -59,16 +59,15 @@ fun ScraperScreen() {
     val isScraping by ScrapeState.isScraping.collectAsState()
     val logs by ScrapeState.logs.collectAsState()
     val outputUri by ScrapeState.outputDirectoryUri.collectAsState()
+    val conflictFolder by ScrapeState.showConflictDialog.collectAsState()
 
     var url by remember { mutableStateOf("https://www.mangago.me/read-manga/threads_of_love/") }
     var startChapter by remember { mutableStateOf("1") }
-    var maxChapters by remember { mutableStateOf("3") }
+    var maxChapters by remember { mutableStateOf("") } // Default empty
     var showLoginDialog by remember { mutableStateOf(false) }
-
-    // Track the URL inside the WebView dialog
     var currentDialogUrl by remember { mutableStateOf("") }
+    var showStartWarning by remember { mutableStateOf(false) }
 
-    // Launcher for selecting output folder
     val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
             context.contentResolver.takePersistableUriPermission(
@@ -77,6 +76,17 @@ fun ScraperScreen() {
             )
             ScrapeState.outputDirectoryUri.value = uri
         }
+    }
+
+    // Function to physically launch the scraping service
+    fun startScraping() {
+        val serviceIntent = Intent(context, ScraperService::class.java).apply {
+            putExtra("URL", url)
+            putExtra("START_CHAPTER", startChapter.toIntOrNull() ?: 1)
+            // Use 99999 as a safe "Download All" trigger to prevent negative index crashes
+            putExtra("MAX_CHAPTERS", maxChapters.toIntOrNull() ?: 99999)
+        }
+        ContextCompat.startForegroundService(context, serviceIntent)
     }
 
     Column(modifier = Modifier.padding(16.dp).fillMaxSize()) {
@@ -103,7 +113,7 @@ fun ScraperScreen() {
             OutlinedTextField(
                 value = maxChapters,
                 onValueChange = { maxChapters = it },
-                label = { Text("Max Chapters") },
+                label = { Text("Max (Leave empty for All)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.weight(1f),
                 enabled = !isScraping
@@ -130,13 +140,13 @@ fun ScraperScreen() {
                     return@Button
                 }
 
-                // Start Foreground Service
-                val serviceIntent = Intent(context, ScraperService::class.java).apply {
-                    putExtra("URL", url)
-                    putExtra("START_CHAPTER", startChapter.toIntOrNull() ?: 1)
-                    putExtra("MAX_CHAPTERS", maxChapters.toIntOrNull() ?: 1)
+                // PRE-CHECK: See if the parent folder is dirty
+                val rootFolder = DocumentFile.fromTreeUri(context, outputUri!!)
+                if (rootFolder != null && rootFolder.listFiles().any { it.isDirectory }) {
+                    showStartWarning = true
+                } else {
+                    startScraping()
                 }
-                ContextCompat.startForegroundService(context, serviceIntent)
             },
             modifier = Modifier.fillMaxWidth(),
             enabled = !isScraping && outputUri != null
@@ -147,7 +157,6 @@ fun ScraperScreen() {
         Spacer(modifier = Modifier.height(16.dp))
         Text("Logs:", style = MaterialTheme.typography.titleMedium)
 
-        // Log Console
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -161,7 +170,62 @@ fun ScraperScreen() {
         }
     }
 
-    // Login Dialog with visible WebView
+    // --- DIALOGS ---
+
+    // 1. Initial Dirty Folder Warning
+    if (showStartWarning) {
+        AlertDialog(
+            onDismissRequest = { showStartWarning = false },
+            title = { Text("Folder Not Empty") },
+            text = { Text("There are already sub-folders inside your selected output directory. Are you sure you want to proceed?") },
+            confirmButton = {
+                Button(onClick = {
+                    showStartWarning = false
+                    startScraping()
+                }) { Text("Proceed") }
+            },
+            dismissButton = {
+                Button(onClick = { showStartWarning = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // 2. Live Folder Conflict Resolution (Triggered by Service)
+    if (conflictFolder != null) {
+        AlertDialog(
+            onDismissRequest = { /* Must explicitly click a button */ },
+            title = { Text("Folder Already Exists") },
+            text = {
+                Column {
+                    Text("The folder '$conflictFolder' already exists. What would you like to do?")
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(modifier = Modifier.fillMaxWidth(), onClick = {
+                        ScrapeState.conflictResolution?.complete(ConflictAction.OVERWRITE)
+                        ScrapeState.showConflictDialog.value = null
+                    }) { Text("Overwrite This Chapter") }
+
+                    Button(modifier = Modifier.fillMaxWidth(), onClick = {
+                        ScrapeState.conflictResolution?.complete(ConflictAction.SKIP)
+                        ScrapeState.showConflictDialog.value = null
+                    }) { Text("Skip This Chapter") }
+
+                    Button(modifier = Modifier.fillMaxWidth(), onClick = {
+                        ScrapeState.conflictResolution?.complete(ConflictAction.OVERWRITE_ALL)
+                        ScrapeState.showConflictDialog.value = null
+                    }) { Text("Overwrite All Future Conflicts") }
+
+                    Button(modifier = Modifier.fillMaxWidth(), onClick = {
+                        ScrapeState.conflictResolution?.complete(ConflictAction.SKIP_ALL)
+                        ScrapeState.showConflictDialog.value = null
+                    }) { Text("Skip All Future Conflicts") }
+                }
+            },
+            confirmButton = {},
+            properties = androidx.compose.ui.window.DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false)
+        )
+    }
+
+    // 3. Login Dialog
     if (showLoginDialog) {
         AlertDialog(
             onDismissRequest = { showLoginDialog = false },
@@ -189,9 +253,7 @@ fun ScraperScreen() {
                         WebView(ctx).apply {
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
-
                             webViewClient = object : WebViewClient() {
-                                // Track the URL as the user clicks links and navigates
                                 override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                                     super.doUpdateVisitedHistory(view, url, isReload)
                                     if (url != null) {
