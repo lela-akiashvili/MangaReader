@@ -352,7 +352,30 @@ class ScraperService : Service() {
                         if (el.tagName.toLowerCase() === 'img') {
                              var srcUrl = el.src || el.getAttribute('src') || "";
                              if (srcUrl && !srcUrl.includes('ajax-loader')) {
-                                 results.push({ type: 'url', data: srcUrl });
+                                 // Check if the domain contains an underscore (e.g. iweb_2)
+                                 var hasUnderscoreDomain = false;
+                                 try {
+                                     var urlObj = new URL(srcUrl);
+                                     hasUnderscoreDomain = urlObj.hostname.includes('_');
+                                 } catch(e) {}
+                                 
+                                 if (hasUnderscoreDomain) {
+                                     // URL has an underscore! Treat it like a canvas and take a screenshot.
+                                     var rect = el.getBoundingClientRect();
+                                     var x = rect.left + window.scrollX;
+                                     var y = rect.top + window.scrollY;
+                                     var w = rect.width;
+                                     var h = rect.height;
+                                     
+                                     if (w > 0 && h > 0) {
+                                         results.push({ type: 'canvas_rect', x: x, y: y, w: w, h: h });
+                                     } else {
+                                         results.push({ type: 'error', data: 'Image dimensions are 0 (Screenshot fallback failed)' });
+                                     }
+                                 } else {
+                                     // Normal, safe domain. Just send the URL back to Kotlin.
+                                     results.push({ type: 'url', data: srcUrl });
+                                 }
                              }
                         } else if (el.tagName.toLowerCase() === 'canvas') {
                              var rect = el.getBoundingClientRect();
