@@ -12,6 +12,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -23,9 +25,15 @@ import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.jsoup.Jsoup
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.InputStream
+import java.io.BufferedOutputStream
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.URL
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -36,27 +44,29 @@ class ScraperService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var webView: WebView? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
-    // Callback to resume coroutine after JS extracts images
     private var jsExtractionCallback: ((String) -> Unit)? = null
-
-    // State flags to prevent double-injection bugs
     private var currentChapterUrl = ""
     private var scriptInjected = false
+
+    private val okHttpClient = OkHttpClient()
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
 
-        // Required to draw WebViews that are larger than the physical screen
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             WebView.enableSlowWholeDocumentDraw()
         }
 
-        // Initialize WebView on Main Thread (Required by Android)
+        // Acquire Partial WakeLock to keep CPU running when screen is off
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MangaScraper::BackgroundScrapeLock")
+        wakeLock?.acquire(10 * 60 * 60 * 1000L /*10 hours max*/)
+
         Handler(Looper.getMainLooper()).post {
             webView = WebView(applicationContext).apply {
-                // Pretend to be a Desktop Browser
                 settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
@@ -64,7 +74,6 @@ class ScraperService : Service() {
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
 
-                // Force a massive layout to prevent mobile viewport cropping
                 layoutParams = ViewGroup.LayoutParams(1920, 10000)
                 measure(
                     View.MeasureSpec.makeMeasureSpec(1920, View.MeasureSpec.EXACTLY),
@@ -77,10 +86,11 @@ class ScraperService : Service() {
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        // Safety check: Only inject ONCE per target chapter URL
                         if (url != null && url == currentChapterUrl && !scriptInjected) {
                             scriptInjected = true
                             ScrapeState.log("Page loaded. Waiting for canvas/images to render...")
+                            // Force WebView to keep JS timers running even in background
+                            view?.resumeTimers()
                             injectExtractionScript()
                         }
                     }
@@ -93,6 +103,7 @@ class ScraperService : Service() {
         val seriesUrl = intent?.getStringExtra("URL") ?: return START_NOT_STICKY
         val startChap = intent.getIntExtra("START_CHAPTER", 1)
         val maxChaps = intent.getIntExtra("MAX_CHAPTERS", 1)
+        val zipOnSuccess = intent.getBooleanExtra("ZIP_ON_SUCCESS", false)
 
         startForeground(NOTIFICATION_ID, buildNotification("Scraper Initializing..."))
         ScrapeState.isScraping.value = true
@@ -100,7 +111,7 @@ class ScraperService : Service() {
 
         serviceScope.launch {
             try {
-                scrapeSeries(seriesUrl, startChap, maxChaps)
+                scrapeSeries(seriesUrl, startChap, maxChaps, zipOnSuccess)
             } catch (e: Exception) {
                 ScrapeState.log("Fatal Error: ${e.message}")
             } finally {
@@ -113,11 +124,10 @@ class ScraperService : Service() {
         return START_NOT_STICKY
     }
 
-    private suspend fun scrapeSeries(seriesUrl: String, startChap: Int, maxChaps: Int) {
+    private suspend fun scrapeSeries(seriesUrl: String, startChap: Int, maxChaps: Int, zipOnSuccess: Boolean) {
         val cookies = CookieManager.getInstance().getCookie(seriesUrl) ?: ""
         ScrapeState.log("Fetching series page...")
 
-        // 1. Fetch main page and parse chapter links natively
         val doc = Jsoup.connect(seriesUrl)
             .header("Cookie", cookies)
             .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
@@ -132,7 +142,7 @@ class ScraperService : Service() {
             }
         }
 
-        chapters.reverse() // Chapters are in reverse order on the site
+        chapters.reverse()
 
         val totalDetected = chapters.size
         ScrapeState.log("Detected $totalDetected total chapters in series.")
@@ -151,19 +161,16 @@ class ScraperService : Service() {
         var perfectlyDownloaded = 0
         var failedChapters = 0
 
-        // 2. Loop through selected chapters
         for ((index, chapterUrl) in selectedChapters.withIndex()) {
             val chapterNum = startIdx + index + 1
             updateNotification("Scraping Chapter $chapterNum...")
             ScrapeState.log("--- Starting Chapter $chapterNum (${index + 1}/${selectedChapters.size}) ---")
 
-            // Wait for JS extraction callback
             val jsonResult = suspendCoroutine<String> { continuation ->
                 jsExtractionCallback = { result ->
                     continuation.resume(result)
                 }
 
-                // Reset flags and load URL on Main Thread
                 currentChapterUrl = chapterUrl
                 scriptInjected = false
                 Handler(Looper.getMainLooper()).post {
@@ -171,7 +178,6 @@ class ScraperService : Service() {
                 }
             }
 
-            // 3. Process Extracted Images using SAFE JSON PARSING
             val imagesList = JSONArray(jsonResult)
             val totalImages = imagesList.length()
             ScrapeState.log("Extracted $totalImages elements from Chapter $chapterNum.")
@@ -196,42 +202,67 @@ class ScraperService : Service() {
             var imagesFailedInChapter = 0
             val failedImageDetails = mutableListOf<String>()
 
-            // 4. Download / Screenshot Each Image
             for (i in 0 until totalImages) {
                 val item = imagesList.getJSONObject(i)
-                val type = item.optString("type", "unknown") // Safe parsing
+                val type = item.optString("type", "unknown")
                 val imgDisplayNum = i + 1
 
                 var success = false
                 var attempts = 0
+                var currentFile: DocumentFile? = null
 
                 while (!success && attempts < 3) {
                     attempts++
                     try {
                         val fileName = String.format("%03d.png", imgDisplayNum)
-                        val file = chapterFolder?.createFile("image/png", fileName)
+                        currentFile = chapterFolder?.createFile("image/png", fileName)
                             ?: throw Exception("Failed to create file")
 
-                        applicationContext.contentResolver.openOutputStream(file.uri)?.use { outStream ->
+                        applicationContext.contentResolver.openOutputStream(currentFile.uri)?.use { outStream ->
 
                             if (type == "url") {
-                                // NATIVE IMAGE URL
                                 val data = item.optString("data", "")
                                 if (data.isEmpty()) throw Exception("URL string was empty")
 
-                                val connection = URL(data).openConnection() as HttpURLConnection
-                                connection.setRequestProperty("Cookie", CookieManager.getInstance().getCookie(data))
-                                connection.setRequestProperty("User-Agent", "Mozilla/5.0")
-                                connection.connectTimeout = 10000
-                                connection.readTimeout = 10000
-                                connection.connect()
+                                try {
+                                    val request = Request.Builder()
+                                        .url(data)
+                                        .header("Cookie", cookies)
+                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                                        .build()
 
-                                connection.inputStream.use { inStream: InputStream ->
-                                    inStream.copyTo(outStream)
+                                    val response = okHttpClient.newCall(request).execute()
+                                    if (!response.isSuccessful) throw Exception("HTTP Error: ${response.code}")
+
+                                    response.body?.byteStream()?.use { inStream ->
+                                        inStream.copyTo(outStream)
+                                    }
+                                } catch (e: IllegalArgumentException) {
+                                    val javaUrl = URL(data)
+                                    val host = javaUrl.host
+                                    val ip = InetAddress.getByName(host).hostAddress
+                                    val ipUrl = data.replaceFirst(host, ip)
+
+                                    val connection = URL(ipUrl).openConnection() as HttpURLConnection
+                                    connection.setRequestProperty("Host", host)
+                                    connection.setRequestProperty("Cookie", cookies)
+                                    connection.setRequestProperty("User-Agent", "Mozilla/5.0")
+                                    connection.connectTimeout = 10000
+                                    connection.readTimeout = 10000
+                                    connection.connect()
+
+                                    connection.inputStream.use { inStream ->
+                                        inStream.copyTo(outStream)
+                                    }
                                 }
 
+                            } else if (type == "base64") {
+                                val base64Data = item.optString("data", "")
+                                val base64String = base64Data.substringAfter(",")
+                                val decodedBytes = Base64.decode(base64String, Base64.DEFAULT)
+                                outStream.write(decodedBytes)
+
                             } else if (type == "canvas_rect") {
-                                // CANVAS SCREENSHOT METHOD
                                 val x = item.optDouble("x", 0.0)
                                 val y = item.optDouble("y", 0.0)
                                 val w = item.optDouble("w", 0.0)
@@ -239,14 +270,13 @@ class ScraperService : Service() {
 
                                 if (w <= 0 || h <= 0) throw Exception("Canvas dimensions are 0")
 
-                                // We MUST take screenshots on the Main UI Thread
                                 val bitmap = withContext(Dispatchers.Main) {
                                     captureWebViewRect(x, y, w, h)
                                 }
 
                                 if (bitmap != null) {
                                     bitmap.compress(Bitmap.CompressFormat.PNG, 100, outStream)
-                                    bitmap.recycle() // Free memory immediately
+                                    bitmap.recycle()
                                 } else {
                                     throw Exception("Bitmap capture returned null")
                                 }
@@ -258,6 +288,7 @@ class ScraperService : Service() {
                         }
                         success = true
                     } catch (e: Exception) {
+                        currentFile?.delete()
                         if (attempts < 3) {
                             ScrapeState.log("$imgDisplayNum/$totalImages failed ($type), try $attempts/3...")
                             delay(2000)
@@ -284,26 +315,62 @@ class ScraperService : Service() {
         ScrapeState.log("=== SCRAPING SESSION COMPLETE ===")
         ScrapeState.log("Perfect Chapters: $perfectlyDownloaded")
         ScrapeState.log("Chapters with Errors/Failed: $failedChapters")
+
+        if (zipOnSuccess && failedChapters == 0 && perfectlyDownloaded > 0) {
+            ScrapeState.log("No errors detected! Compressing folders to .zip...")
+            val rootUri = ScrapeState.outputDirectoryUri.value
+            val rootFolder = rootUri?.let { DocumentFile.fromTreeUri(applicationContext, it) }
+
+            if (rootFolder != null) {
+                try {
+                    val zipFileName = "MangaScrape_${System.currentTimeMillis()}.zip"
+                    val zipFile = rootFolder.createFile("application/zip", zipFileName)
+
+                    if (zipFile != null) {
+                        withContext(Dispatchers.IO) {
+                            applicationContext.contentResolver.openOutputStream(zipFile.uri)?.use { os ->
+                                ZipOutputStream(BufferedOutputStream(os)).use { zos ->
+                                    for (chapterDir in rootFolder.listFiles()) {
+                                        if (chapterDir.isDirectory) {
+                                            for (imageFile in chapterDir.listFiles()) {
+                                                if (imageFile.isFile && imageFile.name != null) {
+                                                    val entry = ZipEntry("${chapterDir.name}/${imageFile.name}")
+                                                    zos.putNextEntry(entry)
+                                                    applicationContext.contentResolver.openInputStream(imageFile.uri)?.use { ins ->
+                                                        ins.copyTo(zos)
+                                                    }
+                                                    zos.closeEntry()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ScrapeState.log("Successfully created zip: $zipFileName")
+                    } else {
+                        ScrapeState.log("Warning: Failed to create zip file.")
+                    }
+                } catch (e: Exception) {
+                    ScrapeState.log("Zipping failed: ${e.message}")
+                }
+            }
+        }
     }
 
-    // PRECISION SCREENSHOT LOGIC
     private fun captureWebViewRect(x: Double, y: Double, w: Double, h: Double): Bitmap? {
         val wv = webView ?: return null
-        val scale = wv.scale // Gets the zoom scale of the WebView
+        val scale = wv.scale
 
-        // Calculate exact pixel dimensions based on zoom scale
         val scaledX = (x * scale).toInt()
         val scaledY = (y * scale).toInt()
         val scaledW = (w * scale).toInt().coerceAtLeast(1)
         val scaledH = (h * scale).toInt().coerceAtLeast(1)
 
         return try {
-            // Create a bitmap exactly the size of the canvas element
             val bitmap = Bitmap.createBitmap(scaledW, scaledH, Bitmap.Config.ARGB_8888)
             val graphicsCanvas = Canvas(bitmap)
 
-            // Shift the graphics canvas backwards by X and Y,
-            // so when the massive WebView draws itself, ONLY the targeted rectangle hits our bitmap
             graphicsCanvas.translate(-scaledX.toFloat(), -scaledY.toFloat())
             wv.draw(graphicsCanvas)
 
@@ -352,7 +419,6 @@ class ScraperService : Service() {
                         if (el.tagName.toLowerCase() === 'img') {
                              var srcUrl = el.src || el.getAttribute('src') || "";
                              if (srcUrl && !srcUrl.includes('ajax-loader')) {
-                                 // Check if the domain contains an underscore (e.g. iweb_2)
                                  var hasUnderscoreDomain = false;
                                  try {
                                      var urlObj = new URL(srcUrl);
@@ -360,7 +426,6 @@ class ScraperService : Service() {
                                  } catch(e) {}
                                  
                                  if (hasUnderscoreDomain) {
-                                     // URL has an underscore! Treat it like a canvas and take a screenshot.
                                      var rect = el.getBoundingClientRect();
                                      var x = rect.left + window.scrollX;
                                      var y = rect.top + window.scrollY;
@@ -373,13 +438,11 @@ class ScraperService : Service() {
                                          results.push({ type: 'error', data: 'Image dimensions are 0 (Screenshot fallback failed)' });
                                      }
                                  } else {
-                                     // Normal, safe domain. Just send the URL back to Kotlin.
                                      results.push({ type: 'url', data: srcUrl });
                                  }
                              }
                         } else if (el.tagName.toLowerCase() === 'canvas') {
                              var rect = el.getBoundingClientRect();
-                             // Calculate absolute position on the entire document layout
                              var x = rect.left + window.scrollX;
                              var y = rect.top + window.scrollY;
                              var w = rect.width;
@@ -388,7 +451,7 @@ class ScraperService : Service() {
                              if (w > 0 && h > 0) {
                                  results.push({ type: 'canvas_rect', x: x, y: y, w: w, h: h });
                              } else {
-                                 results.push({ type: 'error', data: 'Canvas has 0 width or height' });
+                                 results.push({ type: 'error', data: 'Canvas dimensions are 0' });
                              }
                         }
                     }
@@ -434,6 +497,16 @@ class ScraperService : Service() {
     private fun updateNotification(text: String) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(NOTIFICATION_ID, buildNotification(text))
+    }
+
+    override fun onDestroy() {
+        // Release WakeLock when the service completely stops
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+        }
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
