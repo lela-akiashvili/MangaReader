@@ -10,6 +10,8 @@ enum class ConflictAction {
 
 object ScrapeState {
     val isScraping = MutableStateFlow(false)
+    val isPaused = MutableStateFlow(false)
+    val isCancelled = MutableStateFlow(false)
     val logs = MutableStateFlow<List<String>>(emptyList())
     val outputDirectoryUri = MutableStateFlow<Uri?>(null)
 

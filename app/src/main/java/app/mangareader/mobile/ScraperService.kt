@@ -1,4 +1,4 @@
-package app.mangareader.mobile
+package app.mangareader.mobile // CHANGE TO YOUR PACKAGE NAME
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -13,7 +13,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -27,6 +26,7 @@ import org.json.JSONArray
 import org.jsoup.Jsoup
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import java.io.InputStream
 import java.io.BufferedOutputStream
 import java.net.HttpURLConnection
@@ -60,10 +60,9 @@ class ScraperService : Service() {
             WebView.enableSlowWholeDocumentDraw()
         }
 
-        // Acquire Partial WakeLock to keep CPU running when screen is off
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MangaScraper::BackgroundScrapeLock")
-        wakeLock?.acquire(10 * 60 * 60 * 1000L /*10 hours max*/)
+        wakeLock?.acquire(10 * 60 * 60 * 1000L)
 
         Handler(Looper.getMainLooper()).post {
             webView = WebView(applicationContext).apply {
@@ -74,10 +73,11 @@ class ScraperService : Service() {
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
 
-                layoutParams = ViewGroup.LayoutParams(1920, 10000)
+                // FIX 1: Realistic viewport size to enable actual scrolling
+                layoutParams = ViewGroup.LayoutParams(1080, 1920)
                 measure(
-                    View.MeasureSpec.makeMeasureSpec(1920, View.MeasureSpec.EXACTLY),
-                    View.MeasureSpec.makeMeasureSpec(10000, View.MeasureSpec.EXACTLY)
+                    View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(1920, View.MeasureSpec.EXACTLY)
                 )
                 layout(0, 0, measuredWidth, measuredHeight)
 
@@ -88,8 +88,6 @@ class ScraperService : Service() {
                         super.onPageFinished(view, url)
                         if (url != null && url == currentChapterUrl && !scriptInjected) {
                             scriptInjected = true
-                            ScrapeState.log("Page loaded. Waiting for canvas/images to render...")
-                            // Force WebView to keep JS timers running even in background
                             view?.resumeTimers()
                             injectExtractionScript()
                         }
@@ -113,7 +111,7 @@ class ScraperService : Service() {
             try {
                 scrapeSeries(seriesUrl, startChap, maxChaps, zipOnSuccess)
             } catch (e: Exception) {
-                ScrapeState.log("Fatal Error: ${e.message}")
+                ScrapeState.log("[Error] Critical System Failure: ${e.message}")
             } finally {
                 ScrapeState.isScraping.value = false
                 stopForeground(true)
@@ -126,83 +124,115 @@ class ScraperService : Service() {
 
     private suspend fun scrapeSeries(seriesUrl: String, startChap: Int, maxChaps: Int, zipOnSuccess: Boolean) {
         val cookies = CookieManager.getInstance().getCookie(seriesUrl) ?: ""
-        ScrapeState.log("Fetching series page...")
+        ScrapeState.log("[System] Analyzing Series Page for chapters...")
 
         val doc = Jsoup.connect(seriesUrl)
             .header("Cookie", cookies)
             .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .get()
 
-        val chapters = mutableListOf<String>()
+        data class ChapterInfo(val url: String, val name: String)
+        val chapters = mutableListOf<ChapterInfo>()
+
         val rows = doc.select("table#chapter_table tbody tr")
         for (row in rows) {
-            val link = row.select("h4 a.chico").attr("href")
-            if (link.isNotEmpty()) {
-                chapters.add(link)
-            }
+            val anchor = row.select("h4 a.chico")
+            val link = anchor.attr("href")
+            val safeTitle = anchor.text().trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            if (link.isNotEmpty()) chapters.add(ChapterInfo(link, safeTitle))
         }
 
         chapters.reverse()
-
-        val totalDetected = chapters.size
-        ScrapeState.log("Detected $totalDetected total chapters in series.")
+        ScrapeState.log("[System] Successfully found ${chapters.size} chapters.")
 
         val startIdx = (startChap - 1).coerceAtLeast(0)
         val endIdx = (startIdx + maxChaps).coerceAtMost(chapters.size)
 
         if (startIdx >= chapters.size) {
-            ScrapeState.log("Start chapter is greater than total chapters. Stopping.")
+            ScrapeState.log("[Warn] Start chapter is greater than total chapters. Stopping.")
             return
         }
 
         val selectedChapters = chapters.subList(startIdx, endIdx)
-        ScrapeState.log("Will scrape ${selectedChapters.size} chapters (from index $startIdx to ${endIdx-1})")
-
         var perfectlyDownloaded = 0
         var failedChapters = 0
+        val incompleteList = mutableListOf<String>()
+        var applyToAllConflict: ConflictAction? = null
 
-        for ((index, chapterUrl) in selectedChapters.withIndex()) {
+        for ((index, chapter) in selectedChapters.withIndex()) {
+            if (checkPauseOrCancel()) break
+
             val chapterNum = startIdx + index + 1
-            updateNotification("Scraping Chapter $chapterNum...")
-            ScrapeState.log("--- Starting Chapter $chapterNum (${index + 1}/${selectedChapters.size}) ---")
+            val folderName = "Ch$chapterNum - ${chapter.name}"
+
+            updateNotification("Scraping $folderName...")
+            ScrapeState.log("\n[Chapter ${index + 1}/${selectedChapters.size}] Starting: $folderName")
 
             val jsonResult = suspendCoroutine<String> { continuation ->
                 jsExtractionCallback = { result ->
                     continuation.resume(result)
                 }
 
-                currentChapterUrl = chapterUrl
+                currentChapterUrl = chapter.url
                 scriptInjected = false
                 Handler(Looper.getMainLooper()).post {
-                    webView?.loadUrl(chapterUrl)
+                    webView?.loadUrl(chapter.url)
                 }
             }
 
             val imagesList = JSONArray(jsonResult)
             val totalImages = imagesList.length()
-            ScrapeState.log("Extracted $totalImages elements from Chapter $chapterNum.")
 
             if (totalImages == 0) {
-                ScrapeState.log("WARNING: 0 images found. Skipping chapter.")
+                ScrapeState.log("[Error] 0 images found. Skipping chapter.")
                 failedChapters++
+                incompleteList.add("Chapter ${index + 1} (${chapter.name}): Page failed to load completely.")
                 continue
             }
 
             val rootUri = ScrapeState.outputDirectoryUri.value
             if (rootUri == null) {
-                ScrapeState.log("Output folder missing! Aborting.")
+                ScrapeState.log("[Error] Output folder missing! Aborting.")
                 return
             }
             val rootFolder = DocumentFile.fromTreeUri(applicationContext, rootUri)
-            var chapterFolder = rootFolder?.findFile("Chapter_$chapterNum")
-            if (chapterFolder == null) {
-                chapterFolder = rootFolder?.createDirectory("Chapter_$chapterNum")
+            var chapterFolder = rootFolder?.findFile(folderName)
+
+            if (chapterFolder != null && chapterFolder.listFiles().isNotEmpty()) {
+                var action = applyToAllConflict
+                if (action == null) {
+                    ScrapeState.conflictResolution = CompletableDeferred()
+                    ScrapeState.showConflictDialog.value = folderName
+                    action = ScrapeState.conflictResolution?.await()
+                    ScrapeState.conflictResolution = null
+
+                    if (action == ConflictAction.OVERWRITE_ALL || action == ConflictAction.SKIP_ALL) {
+                        applyToAllConflict = action
+                    }
+                }
+
+                when (action) {
+                    ConflictAction.SKIP, ConflictAction.SKIP_ALL -> {
+                        ScrapeState.log("[Warn] SKIPPED: '$folderName' (User selected No)")
+                        continue
+                    }
+                    ConflictAction.OVERWRITE, ConflictAction.OVERWRITE_ALL -> {
+                        ScrapeState.log("[Warn] OVERWRITING: '$folderName'")
+                        for (file in chapterFolder.listFiles()) {
+                            file.delete()
+                        }
+                    }
+                    else -> {}
+                }
+            } else if (chapterFolder == null) {
+                chapterFolder = rootFolder?.createDirectory(folderName)
             }
 
             var imagesFailedInChapter = 0
-            val failedImageDetails = mutableListOf<String>()
 
             for (i in 0 until totalImages) {
+                if (checkPauseOrCancel()) break
+
                 val item = imagesList.getJSONObject(i)
                 val type = item.optString("type", "unknown")
                 val imgDisplayNum = i + 1
@@ -214,16 +244,17 @@ class ScraperService : Service() {
                 while (!success && attempts < 3) {
                     attempts++
                     try {
-                        val fileName = String.format("%03d.png", imgDisplayNum)
-                        currentFile = chapterFolder?.createFile("image/png", fileName)
-                            ?: throw Exception("Failed to create file")
+                        if (type == "url") {
+                            val data = item.optString("data", "")
+                            if (data.isEmpty()) throw Exception("URL string was empty")
 
-                        applicationContext.contentResolver.openOutputStream(currentFile.uri)?.use { outStream ->
+                            var responseStream: InputStream? = null
+                            var mimeType = "image/jpeg"
+                            var extension = ".jpg"
+                            var responseToClose: Response? = null
+                            var connectionToDisconnect: HttpURLConnection? = null
 
-                            if (type == "url") {
-                                val data = item.optString("data", "")
-                                if (data.isEmpty()) throw Exception("URL string was empty")
-
+                            try {
                                 try {
                                     val request = Request.Builder()
                                         .url(data)
@@ -234,9 +265,14 @@ class ScraperService : Service() {
                                     val response = okHttpClient.newCall(request).execute()
                                     if (!response.isSuccessful) throw Exception("HTTP Error: ${response.code}")
 
-                                    response.body?.byteStream()?.use { inStream ->
-                                        inStream.copyTo(outStream)
-                                    }
+                                    val contentType = response.header("Content-Type")?.lowercase() ?: ""
+                                    if (contentType.contains("png")) { mimeType = "image/png"; extension = ".png" }
+                                    else if (contentType.contains("webp")) { mimeType = "image/webp"; extension = ".webp" }
+                                    else if (contentType.contains("gif")) { mimeType = "image/gif"; extension = ".gif" }
+
+                                    responseStream = response.body?.byteStream()
+                                    responseToClose = response
+
                                 } catch (e: IllegalArgumentException) {
                                     val javaUrl = URL(data)
                                     val host = javaUrl.host
@@ -251,73 +287,106 @@ class ScraperService : Service() {
                                     connection.readTimeout = 10000
                                     connection.connect()
 
-                                    connection.inputStream.use { inStream ->
-                                        inStream.copyTo(outStream)
+                                    val contentType = connection.contentType?.lowercase() ?: ""
+                                    if (contentType.contains("png")) { mimeType = "image/png"; extension = ".png" }
+                                    else if (contentType.contains("webp")) { mimeType = "image/webp"; extension = ".webp" }
+                                    else if (contentType.contains("gif")) { mimeType = "image/gif"; extension = ".gif" }
+
+                                    responseStream = connection.inputStream
+                                    connectionToDisconnect = connection
+                                }
+
+                                if (responseStream != null) {
+                                    val safeImageName = "${chapter.name}_${String.format("%03d", imgDisplayNum)}$extension"
+                                    currentFile = chapterFolder?.createFile(mimeType, safeImageName)
+                                        ?: throw Exception("Failed to create file")
+
+                                    applicationContext.contentResolver.openOutputStream(currentFile.uri)?.use { outStream ->
+                                        responseStream.copyTo(outStream)
+                                    }
+                                    ScrapeState.log("  > Downloaded Fallback Image: $safeImageName")
+                                }
+                            } finally {
+                                responseToClose?.close()
+                                connectionToDisconnect?.disconnect()
+                            }
+
+                        } else if (type == "canvas_rect") {
+                            val x = item.optDouble("x", 0.0)
+                            val y = item.optDouble("y", 0.0)
+                            val w = item.optDouble("w", 0.0)
+                            val h = item.optDouble("h", 0.0)
+
+                            if (w <= 0 || h <= 0) throw Exception("Canvas dimensions are 0")
+
+                            val safeImageName = "${chapter.name}_${String.format("%03d", imgDisplayNum)}.webp"
+                            currentFile = chapterFolder?.createFile("image/webp", safeImageName)
+                                ?: throw Exception("Failed to create file")
+
+                            val bitmap = withContext(Dispatchers.Main) {
+                                captureWebViewRect(x, y, w, h)
+                            }
+
+                            if (bitmap != null) {
+                                applicationContext.contentResolver.openOutputStream(currentFile.uri)?.use { outStream ->
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, 100, outStream)
+                                    } else {
+                                        @Suppress("DEPRECATION")
+                                        bitmap.compress(Bitmap.CompressFormat.WEBP, 100, outStream)
                                     }
                                 }
-
-                            } else if (type == "base64") {
-                                val base64Data = item.optString("data", "")
-                                val base64String = base64Data.substringAfter(",")
-                                val decodedBytes = Base64.decode(base64String, Base64.DEFAULT)
-                                outStream.write(decodedBytes)
-
-                            } else if (type == "canvas_rect") {
-                                val x = item.optDouble("x", 0.0)
-                                val y = item.optDouble("y", 0.0)
-                                val w = item.optDouble("w", 0.0)
-                                val h = item.optDouble("h", 0.0)
-
-                                if (w <= 0 || h <= 0) throw Exception("Canvas dimensions are 0")
-
-                                val bitmap = withContext(Dispatchers.Main) {
-                                    captureWebViewRect(x, y, w, h)
-                                }
-
-                                if (bitmap != null) {
-                                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, outStream)
-                                    bitmap.recycle()
-                                } else {
-                                    throw Exception("Bitmap capture returned null")
-                                }
-
-                            } else if (type == "error") {
-                                val err = item.optString("data", "Unknown JS error")
-                                throw Exception("JS Error: $err")
+                                bitmap.recycle()
+                                ScrapeState.log("  > Captured Canvas (PNG->WEBP): $safeImageName")
+                            } else {
+                                throw Exception("Bitmap capture returned null")
                             }
                         }
                         success = true
                     } catch (e: Exception) {
                         currentFile?.delete()
                         if (attempts < 3) {
-                            ScrapeState.log("$imgDisplayNum/$totalImages failed ($type), try $attempts/3...")
+                            ScrapeState.log("  > [Warn] Retrying Page_$imgDisplayNum (Attempt ${attempts+1}/3)")
+                            if (checkPauseOrCancel()) break
                             delay(2000)
                         } else {
-                            ScrapeState.log("FAILED permanently: Image $imgDisplayNum. Reason: ${e.message}")
+                            ScrapeState.log("  > [Error] Skipped Page_$imgDisplayNum (Server Error: ${e.message})")
                             imagesFailedInChapter++
-                            failedImageDetails.add("#$imgDisplayNum")
                         }
                     }
                 }
             }
 
+            if (ScrapeState.isCancelled.value) {
+                ScrapeState.log("[Error] EXTRACTION CANCELLED by user.")
+                break
+            }
+
+            ScrapeState.log("[System] Finished. Total pages saved: ${totalImages - imagesFailedInChapter}/$totalImages")
+
             if (imagesFailedInChapter == 0) {
                 perfectlyDownloaded++
-                ScrapeState.log("Chapter $chapterNum downloaded perfectly ($totalImages/$totalImages).")
             } else {
                 failedChapters++
-                val successCount = totalImages - imagesFailedInChapter
-                ScrapeState.log("Chapter $chapterNum finished with errors. ($successCount/$totalImages). Failed: ${failedImageDetails.joinToString()}")
+                incompleteList.add("Chapter ${index + 1} (${chapter.name}): Incomplete (${totalImages - imagesFailedInChapter}/$totalImages pages)")
             }
         }
 
         updateNotification("Scraping Complete!")
-        ScrapeState.log("=== SCRAPING SESSION COMPLETE ===")
-        ScrapeState.log("Perfect Chapters: $perfectlyDownloaded")
-        ScrapeState.log("Chapters with Errors/Failed: $failedChapters")
 
-        if (zipOnSuccess && failedChapters == 0 && perfectlyDownloaded > 0) {
-            ScrapeState.log("No errors detected! Compressing folders to .zip...")
+        if (!ScrapeState.isCancelled.value) {
+            ScrapeState.log("\n>>> ALL CHAPTERS PROCESSED SUCCESSFULLY <<<")
+
+            if (incompleteList.isNotEmpty()) {
+                ScrapeState.log("\n--- EXTRACTION SUMMARY WITH ERRORS ---")
+                for (issue in incompleteList) {
+                    ScrapeState.log(" > $issue")
+                }
+            }
+        }
+
+        if (zipOnSuccess && failedChapters == 0 && perfectlyDownloaded > 0 && !ScrapeState.isCancelled.value) {
+            ScrapeState.log("[System] No errors detected! Compressing folders to .zip...")
             val rootUri = ScrapeState.outputDirectoryUri.value
             val rootFolder = rootUri?.let { DocumentFile.fromTreeUri(applicationContext, it) }
 
@@ -347,15 +416,30 @@ class ScraperService : Service() {
                                 }
                             }
                         }
-                        ScrapeState.log("Successfully created zip: $zipFileName")
+                        ScrapeState.log("[Success] Successfully created zip: $zipFileName")
                     } else {
-                        ScrapeState.log("Warning: Failed to create zip file.")
+                        ScrapeState.log("[Warn] Warning: Failed to create zip file.")
                     }
                 } catch (e: Exception) {
-                    ScrapeState.log("Zipping failed: ${e.message}")
+                    ScrapeState.log("[Error] Zipping failed: ${e.message}")
                 }
             }
         }
+    }
+
+    private suspend fun checkPauseOrCancel(): Boolean {
+        if (ScrapeState.isPaused.value) {
+            updateNotification("Scraping Paused")
+            ScrapeState.log("[Warn] Scraping Paused...")
+            while (ScrapeState.isPaused.value && !ScrapeState.isCancelled.value) {
+                delay(500)
+            }
+            if (!ScrapeState.isCancelled.value) {
+                ScrapeState.log("[Success] Scraping Resumed!")
+                updateNotification("Scraping Resumed")
+            }
+        }
+        return ScrapeState.isCancelled.value
     }
 
     private fun captureWebViewRect(x: Double, y: Double, w: Double, h: Double): Bitmap? {
@@ -384,26 +468,75 @@ class ScraperService : Service() {
     private fun injectExtractionScript() {
         val js = """
             javascript:(function() {
-                var checkInterval = setInterval(function() {
-                    var loaders = document.querySelectorAll('img[src*="ajax-loader"]');
-                    var isLoaded = true;
-                    for(var i=0; i<loaders.length; i++) {
-                        if (window.getComputedStyle(loaders[i].parentNode).display !== 'none') {
-                            isLoaded = false;
-                            break;
+                var expectedTotal = -1;
+                try {
+                    var container = document.getElementById('pic_container');
+                    if (container) {
+                        var html = container.innerHTML;
+                        var matches = html.match(/\(\d+\/(\d+)\)/g);
+                        if (matches) {
+                            var totals = matches.map(function(m) { 
+                                var exec = /\(\d+\/(\d+)\)/.exec(m);
+                                return exec ? parseInt(exec[1]) : 0;
+                            });
+                            expectedTotal = Math.max.apply(Math, totals);
                         }
                     }
-                    if (isLoaded || loaders.length === 0) {
-                        clearInterval(checkInterval);
-                        clearTimeout(safetyTimeout);
-                        extractImages();
+                } catch(e) {}
+
+                var totalStr = expectedTotal !== -1 ? expectedTotal : "?";
+                Android.logMessage("[System] Detected " + totalStr + " total pages.");
+                Android.logMessage("[System] Scrolling through chapter to assemble and extract pages...");
+
+                var lastScrollY = -1;
+                var stuckCounter = 0;
+
+                var scrollInterval = setInterval(function() {
+                    window.scrollBy(0, window.innerHeight * 0.8);
+                    
+                    var currentScrollY = window.scrollY;
+                    if (Math.abs(currentScrollY - lastScrollY) < 5) {
+                        stuckCounter++;
+                        
+                        // Jiggle logic
+                        if (stuckCounter % 2 === 0) {
+                            window.scrollBy(0, -400);
+                            setTimeout(function() { window.scrollBy(0, 400); }, 150);
+                        }
+
+                        var loaders = document.querySelectorAll('img[src*="ajax-loader"]');
+                        var isLoaded = true;
+                        for(var i=0; i<loaders.length; i++) {
+                            if (window.getComputedStyle(loaders[i].parentNode).display !== 'none') {
+                                isLoaded = false;
+                                break;
+                            }
+                        }
+
+                        var elements = document.getElementById('pic_container') ? document.getElementById('pic_container').querySelectorAll('img:not(.loading), canvas') : [];
+                        var validCount = 0;
+                        for (var j=0; j<elements.length; j++) {
+                            var src = elements[j].src || "";
+                            if (src.indexOf('ajax-loader') === -1) validCount++;
+                        }
+
+                        var conditionMet = (isLoaded && stuckCounter >= 5) || (expectedTotal > 0 && validCount >= expectedTotal);
+                        
+                        if (conditionMet || stuckCounter >= 15) {
+                            clearInterval(scrollInterval);
+                            clearTimeout(safetyTimeout);
+                            extractImages();
+                        }
+                    } else {
+                        stuckCounter = 0;
+                        lastScrollY = currentScrollY;
                     }
-                }, 2000);
+                }, 800);
 
                 var safetyTimeout = setTimeout(function() {
-                    clearInterval(checkInterval);
+                    clearInterval(scrollInterval);
                     extractImages();
-                }, 60000);
+                }, 90000);
 
                 function extractImages() {
                     var results = [];
@@ -435,7 +568,7 @@ class ScraperService : Service() {
                                      if (w > 0 && h > 0) {
                                          results.push({ type: 'canvas_rect', x: x, y: y, w: w, h: h });
                                      } else {
-                                         results.push({ type: 'error', data: 'Image dimensions are 0 (Screenshot fallback failed)' });
+                                         results.push({ type: 'error', data: 'Image dimensions are 0' });
                                      }
                                  } else {
                                      results.push({ type: 'url', data: srcUrl });
@@ -470,6 +603,11 @@ class ScraperService : Service() {
         fun onImagesExtracted(jsonResult: String) {
             jsExtractionCallback?.invoke(jsonResult)
             jsExtractionCallback = null
+        }
+
+        @JavascriptInterface
+        fun logMessage(msg: String) {
+            ScrapeState.log(msg)
         }
     }
 

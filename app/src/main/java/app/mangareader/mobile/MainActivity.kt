@@ -21,6 +21,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -64,6 +65,7 @@ fun ScraperScreen() {
     var url by remember { mutableStateOf("https://www.mangago.me/read-manga/threads_of_love/") }
     var startChapter by remember { mutableStateOf("1") }
     var maxChapters by remember { mutableStateOf("") } // Default empty
+    var zipOnSuccess by remember { mutableStateOf(false) }
     var showLoginDialog by remember { mutableStateOf(false) }
     var currentDialogUrl by remember { mutableStateOf("") }
     var showStartWarning by remember { mutableStateOf(false) }
@@ -80,11 +82,14 @@ fun ScraperScreen() {
 
     // Function to physically launch the scraping service
     fun startScraping() {
+        ScrapeState.isPaused.value = false
+        ScrapeState.isCancelled.value = false
         val serviceIntent = Intent(context, ScraperService::class.java).apply {
             putExtra("URL", url)
             putExtra("START_CHAPTER", startChapter.toIntOrNull() ?: 1)
             // Use 99999 as a safe "Download All" trigger to prevent negative index crashes
             putExtra("MAX_CHAPTERS", maxChapters.toIntOrNull() ?: 99999)
+            putExtra("ZIP_ON_SUCCESS", zipOnSuccess)
         }
         ContextCompat.startForegroundService(context, serviceIntent)
     }
@@ -131,27 +136,46 @@ fun ScraperScreen() {
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        Button(
-            onClick = {
-                if (outputUri == null) {
-                    Toast.makeText(context, "Please select an output folder first", Toast.LENGTH_SHORT).show()
-                    return@Button
-                }
+        if (!isScraping) {
+            Button(
+                onClick = {
+                    if (outputUri == null) {
+                        Toast.makeText(context, "Please select an output folder first", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
 
-                // PRE-CHECK: See if the parent folder is dirty
-                val rootFolder = DocumentFile.fromTreeUri(context, outputUri!!)
-                if (rootFolder != null && rootFolder.listFiles().any { it.isDirectory }) {
-                    showStartWarning = true
-                } else {
-                    startScraping()
+                    // PRE-CHECK: See if the parent folder is dirty
+                    val rootFolder = DocumentFile.fromTreeUri(context, outputUri!!)
+                    if (rootFolder != null && rootFolder.listFiles().any { it.isDirectory }) {
+                        showStartWarning = true
+                    } else {
+                        startScraping()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = outputUri != null
+            ) {
+                Text("Start Scraping")
+            }
+        } else {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val isPaused by ScrapeState.isPaused.collectAsState()
+                Button(
+                    onClick = { ScrapeState.isPaused.value = !isPaused },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(if (isPaused) "Resume" else "Pause")
                 }
-            },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = !isScraping && outputUri != null
-        ) {
-            Text(if (isScraping) "Scraping in Progress..." else "Start Scraping")
+                Button(
+                    onClick = { ScrapeState.isCancelled.value = true },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Stop")
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
