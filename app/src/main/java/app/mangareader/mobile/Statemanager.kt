@@ -2,6 +2,7 @@ package app.mangareader.mobile
 
 import android.net.Uri
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 
 enum class ConflictAction {
@@ -19,6 +20,9 @@ object ScrapeState {
     val showConflictDialog = MutableStateFlow<String?>(null)
     var conflictResolution: CompletableDeferred<ConflictAction>? = null
 
+    // NEW: Background Notification Trigger for the Reader
+    val latestDownload = MutableSharedFlow<String>(extraBufferCapacity = 1)
+
     fun log(message: String) {
         val currentLogs = logs.value.toMutableList()
         currentLogs.add(0, message)
@@ -26,6 +30,11 @@ object ScrapeState {
             currentLogs.removeLast()
         }
         logs.value = currentLogs
+
+        // Silently notify the reader if a batch or chapter finishes
+        if (message.contains("downloaded perfectly") || message.contains("SUCCESSFULLY")) {
+            latestDownload.tryEmit(message.substringAfter("]").trim())
+        }
     }
 
     fun clearLogs() {

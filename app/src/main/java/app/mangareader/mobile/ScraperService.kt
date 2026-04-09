@@ -73,7 +73,7 @@ class ScraperService : Service() {
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
 
-                // FIX 1: Realistic viewport size to enable actual scrolling
+                // Realistic viewport size to enable actual scrolling
                 layoutParams = ViewGroup.LayoutParams(1080, 1920)
                 measure(
                     View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
@@ -99,9 +99,11 @@ class ScraperService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val seriesUrl = intent?.getStringExtra("URL") ?: return START_NOT_STICKY
+        val seriesTitle = intent.getStringExtra("SERIES_TITLE") ?: "Unknown_Series"
+        val manualCookie = intent.getStringExtra("COOKIE") ?: ""
         val startChap = intent.getIntExtra("START_CHAPTER", 1)
-        val maxChaps = intent.getIntExtra("MAX_CHAPTERS", 1)
-        val zipOnSuccess = intent.getBooleanExtra("ZIP_ON_SUCCESS", false)
+        val maxChaps = intent.getIntExtra("MAX_CHAPTERS", 99999)
+        val zipOnSuccess = intent.getBooleanExtra("ZIP_ON_SUCCESS", true)
 
         startForeground(NOTIFICATION_ID, buildNotification("Scraper Initializing..."))
         ScrapeState.isScraping.value = true
@@ -109,7 +111,7 @@ class ScraperService : Service() {
 
         serviceScope.launch {
             try {
-                scrapeSeries(seriesUrl, startChap, maxChaps, zipOnSuccess)
+                scrapeSeries(seriesUrl, seriesTitle, manualCookie, startChap, maxChaps, zipOnSuccess)
             } catch (e: Exception) {
                 ScrapeState.log("[Error] Critical System Failure: ${e.message}")
             } finally {
@@ -122,8 +124,15 @@ class ScraperService : Service() {
         return START_NOT_STICKY
     }
 
-    private suspend fun scrapeSeries(seriesUrl: String, startChap: Int, maxChaps: Int, zipOnSuccess: Boolean) {
-        val cookies = CookieManager.getInstance().getCookie(seriesUrl) ?: ""
+    private suspend fun scrapeSeries(
+        seriesUrl: String,
+        seriesTitle: String,
+        manualCookie: String,
+        startChap: Int,
+        maxChaps: Int,
+        zipOnSuccess: Boolean
+    ) {
+        val cookies = CookieManager.getInstance().getCookie(seriesUrl) ?: manualCookie
         ScrapeState.log("[System] Analyzing Series Page for chapters...")
 
         val doc = Jsoup.connect(seriesUrl)
@@ -133,6 +142,20 @@ class ScraperService : Service() {
 
         data class ChapterInfo(val url: String, val name: String)
         val chapters = mutableListOf<ChapterInfo>()
+        val rootUri = ScrapeState.outputDirectoryUri.value
+
+        if (rootUri == null) {
+            ScrapeState.log("[Error] Output folder missing! Aborting.")
+            return
+        }
+
+        val rootFolder = DocumentFile.fromTreeUri(applicationContext, rootUri)
+
+        // Create the master folder for the series inside the root
+        var seriesDir = rootFolder?.findFile(seriesTitle)
+        if (seriesDir == null) {
+            seriesDir = rootFolder?.createDirectory(seriesTitle)
+        }
 
         val rows = doc.select("table#chapter_table tbody tr")
         for (row in rows) {
@@ -190,13 +213,8 @@ class ScraperService : Service() {
                 continue
             }
 
-            val rootUri = ScrapeState.outputDirectoryUri.value
-            if (rootUri == null) {
-                ScrapeState.log("[Error] Output folder missing! Aborting.")
-                return
-            }
-            val rootFolder = DocumentFile.fromTreeUri(applicationContext, rootUri)
-            var chapterFolder = rootFolder?.findFile(folderName)
+            // Ensure chapter goes inside the specific Series folder, not the Root!
+            var chapterFolder = seriesDir?.findFile(folderName)
 
             if (chapterFolder != null && chapterFolder.listFiles().isNotEmpty()) {
                 var action = applyToAllConflict
@@ -225,7 +243,7 @@ class ScraperService : Service() {
                     else -> {}
                 }
             } else if (chapterFolder == null) {
-                chapterFolder = rootFolder?.createDirectory(folderName)
+                chapterFolder = seriesDir?.createDirectory(folderName)
             }
 
             var imagesFailedInChapter = 0
@@ -387,19 +405,16 @@ class ScraperService : Service() {
 
         if (zipOnSuccess && failedChapters == 0 && perfectlyDownloaded > 0 && !ScrapeState.isCancelled.value) {
             ScrapeState.log("[System] No errors detected! Compressing folders to .zip...")
-            val rootUri = ScrapeState.outputDirectoryUri.value
-            val rootFolder = rootUri?.let { DocumentFile.fromTreeUri(applicationContext, it) }
-
-            if (rootFolder != null) {
+            if (seriesDir != null) {
                 try {
-                    val zipFileName = "MangaScrape_${System.currentTimeMillis()}.zip"
-                    val zipFile = rootFolder.createFile("application/zip", zipFileName)
+                    val zipFileName = "MangaScrape_${seriesTitle}_${System.currentTimeMillis()}.zip"
+                    val zipFile = seriesDir.createFile("application/zip", zipFileName)
 
                     if (zipFile != null) {
                         withContext(Dispatchers.IO) {
                             applicationContext.contentResolver.openOutputStream(zipFile.uri)?.use { os ->
                                 ZipOutputStream(BufferedOutputStream(os)).use { zos ->
-                                    for (chapterDir in rootFolder.listFiles()) {
+                                    for (chapterDir in seriesDir.listFiles()) {
                                         if (chapterDir.isDirectory) {
                                             for (imageFile in chapterDir.listFiles()) {
                                                 if (imageFile.isFile && imageFile.name != null) {
