@@ -434,6 +434,12 @@ class ScraperService : Service() {
             }
         }
 
+        // NEW: Automatically resync the JSON library cache behind the scenes!
+        if (rootUri != null) {
+            ScrapeState.log("[System] Auto-syncing library cache...")
+            app.mangareader.mobile.utils.FileUtils.syncLibrary(applicationContext, rootUri)
+        }
+
         if (!ScrapeState.isCancelled.value) {
             ScrapeState.log("\n>>> ALL CHAPTERS PROCESSED SUCCESSFULLY <<<")
 

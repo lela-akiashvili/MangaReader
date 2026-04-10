@@ -82,6 +82,19 @@ fun HomeScreen(
         isSyncing = false
     }
 
+    // NEW: Auto-refresh hook that listens to the background scraper!
+    val isScraping by app.mangareader.mobile.ScrapeState.isScraping.collectAsState()
+    LaunchedEffect(isScraping) {
+        if (!isScraping) {
+            withContext(Dispatchers.IO) {
+                val cached = FileUtils.getCachedLibrary(context, rootFolderUri)
+                if (cached.isNotEmpty()) {
+                    mangaList = cached
+                }
+            }
+        }
+    }
+
     val filteredList by remember {
         derivedStateOf {
             var temp = mangaList
