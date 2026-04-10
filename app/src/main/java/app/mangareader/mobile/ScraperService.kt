@@ -28,12 +28,9 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.InputStream
-import java.io.BufferedOutputStream
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -73,11 +70,11 @@ class ScraperService : Service() {
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
 
-                // Realistic viewport size to enable actual scrolling
-                layoutParams = ViewGroup.LayoutParams(1080, 1920)
+                // UPDATED: Massive 4K Viewport to Guarantee Highest Res Canvas captures!
+                layoutParams = ViewGroup.LayoutParams(2560, 3500)
                 measure(
-                    View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
-                    View.MeasureSpec.makeMeasureSpec(1920, View.MeasureSpec.EXACTLY)
+                    View.MeasureSpec.makeMeasureSpec(2560, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(3500, View.MeasureSpec.EXACTLY)
                 )
                 layout(0, 0, measuredWidth, measuredHeight)
 
@@ -99,11 +96,11 @@ class ScraperService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val seriesUrl = intent?.getStringExtra("URL") ?: return START_NOT_STICKY
-        val seriesTitle = intent.getStringExtra("SERIES_TITLE") ?: "Unknown_Series"
+        val seriesTitle = intent.getStringExtra("SERIES_TITLE") ?: ""
         val manualCookie = intent.getStringExtra("COOKIE") ?: ""
         val startChap = intent.getIntExtra("START_CHAPTER", 1)
+        val baseChap = intent.getIntExtra("BASE_CHAPTER", startChap) // Decouples UI iteration from File Numbering
         val maxChaps = intent.getIntExtra("MAX_CHAPTERS", 99999)
-        val zipOnSuccess = intent.getBooleanExtra("ZIP_ON_SUCCESS", true)
 
         startForeground(NOTIFICATION_ID, buildNotification("Scraper Initializing..."))
         ScrapeState.isScraping.value = true
@@ -111,7 +108,7 @@ class ScraperService : Service() {
 
         serviceScope.launch {
             try {
-                scrapeSeries(seriesUrl, seriesTitle, manualCookie, startChap, maxChaps, zipOnSuccess)
+                scrapeSeries(seriesUrl, seriesTitle, manualCookie, startChap, baseChap, maxChaps)
             } catch (e: Exception) {
                 ScrapeState.log("[Error] Critical System Failure: ${e.message}")
             } finally {
@@ -129,8 +126,8 @@ class ScraperService : Service() {
         seriesTitle: String,
         manualCookie: String,
         startChap: Int,
-        maxChaps: Int,
-        zipOnSuccess: Boolean
+        baseChap: Int,
+        maxChaps: Int
     ) {
         val cookies = CookieManager.getInstance().getCookie(seriesUrl) ?: manualCookie
         ScrapeState.log("[System] Analyzing Series Page for chapters...")
@@ -150,11 +147,25 @@ class ScraperService : Service() {
         }
 
         val rootFolder = DocumentFile.fromTreeUri(applicationContext, rootUri)
+        var targetDir = rootFolder
 
-        // Create the master folder for the series inside the root
-        var seriesDir = rootFolder?.findFile(seriesTitle)
-        if (seriesDir == null) {
-            seriesDir = rootFolder?.createDirectory(seriesTitle)
+        if (seriesTitle.isNotBlank()) {
+            var mangasDir: DocumentFile?
+
+            if (rootFolder?.name?.equals("mangas", ignoreCase = true) == true) {
+                mangasDir = rootFolder
+            } else {
+                mangasDir = rootFolder?.listFiles()?.find { it.isDirectory && it.name.equals("mangas", ignoreCase = true) }
+                if (mangasDir == null) {
+                    mangasDir = rootFolder?.createDirectory("Mangas")
+                }
+            }
+
+            var seriesDir = mangasDir?.findFile(seriesTitle)
+            if (seriesDir == null) {
+                seriesDir = mangasDir?.createDirectory(seriesTitle)
+            }
+            targetDir = seriesDir
         }
 
         val rows = doc.select("table#chapter_table tbody tr")
@@ -185,36 +196,46 @@ class ScraperService : Service() {
         for ((index, chapter) in selectedChapters.withIndex()) {
             if (checkPauseOrCancel()) break
 
-            val chapterNum = startIdx + index + 1
+            val chapterNum = baseChap + index // Guarantees chronological folder naming!
             val folderName = "Ch$chapterNum - ${chapter.name}"
 
             updateNotification("Scraping $folderName...")
             ScrapeState.log("\n[Chapter ${index + 1}/${selectedChapters.size}] Starting: $folderName")
 
-            val jsonResult = suspendCoroutine<String> { continuation ->
-                jsExtractionCallback = { result ->
-                    continuation.resume(result)
+            // UPDATED: 4-Try Polling loop for handling background rendering interruptions!
+            var jsonResult = ""
+            var imagesList = JSONArray()
+            var totalImages = 0
+            var htmlAttempts = 0
+
+            while (htmlAttempts < 4) {
+                jsonResult = suspendCoroutine<String> { continuation ->
+                    jsExtractionCallback = { result -> continuation.resume(result) }
+                    currentChapterUrl = chapter.url
+                    scriptInjected = false
+                    Handler(Looper.getMainLooper()).post { webView?.loadUrl(chapter.url) }
                 }
 
-                currentChapterUrl = chapter.url
-                scriptInjected = false
-                Handler(Looper.getMainLooper()).post {
-                    webView?.loadUrl(chapter.url)
+                imagesList = JSONArray(jsonResult)
+                totalImages = imagesList.length()
+
+                if (totalImages > 0 && imagesList.optJSONObject(0)?.optString("type") != "error") {
+                    break // Pages rendered beautifully!
                 }
+
+                htmlAttempts++
+                ScrapeState.log("  > [Warn] Awaiting images... (Attempt $htmlAttempts/4)")
+                delay(2000)
             }
 
-            val imagesList = JSONArray(jsonResult)
-            val totalImages = imagesList.length()
-
-            if (totalImages == 0) {
-                ScrapeState.log("[Error] 0 images found. Skipping chapter.")
+            if (totalImages == 0 || imagesList.optJSONObject(0)?.optString("type") == "error") {
+                ScrapeState.log("[Error] Page failed to completely render. Skipping chapter.")
                 failedChapters++
-                incompleteList.add("Chapter ${index + 1} (${chapter.name}): Page failed to load completely.")
+                incompleteList.add("Chapter ${index + 1} (${chapter.name}): Load Timeout.")
                 continue
             }
 
-            // Ensure chapter goes inside the specific Series folder, not the Root!
-            var chapterFolder = seriesDir?.findFile(folderName)
+            var chapterFolder = targetDir?.findFile(folderName)
 
             if (chapterFolder != null && chapterFolder.listFiles().isNotEmpty()) {
                 var action = applyToAllConflict
@@ -243,7 +264,7 @@ class ScraperService : Service() {
                     else -> {}
                 }
             } else if (chapterFolder == null) {
-                chapterFolder = seriesDir?.createDirectory(folderName)
+                chapterFolder = targetDir?.createDirectory(folderName)
             }
 
             var imagesFailedInChapter = 0
@@ -269,6 +290,18 @@ class ScraperService : Service() {
                             var responseStream: InputStream? = null
                             var mimeType = "image/jpeg"
                             var extension = ".jpg"
+
+                            // 1. Extract the exact extension from the URL string
+                            val urlExt = data.substringAfterLast('.', "").substringBefore("?").substringBefore("#").lowercase()
+                            when (urlExt) {
+                                "png" -> { mimeType = "image/png"; extension = ".png" }
+                                "webp" -> { mimeType = "image/webp"; extension = ".webp" }
+                                "gif" -> { mimeType = "image/gif"; extension = ".gif" }
+                                "jpeg" -> { mimeType = "image/jpeg"; extension = ".jpeg" }
+                                "bmp" -> { mimeType = "image/bmp"; extension = ".bmp" }
+                                "avif" -> { mimeType = "image/avif"; extension = ".avif" }
+                            }
+
                             var responseToClose: Response? = null
                             var connectionToDisconnect: HttpURLConnection? = null
 
@@ -283,10 +316,12 @@ class ScraperService : Service() {
                                     val response = okHttpClient.newCall(request).execute()
                                     if (!response.isSuccessful) throw Exception("HTTP Error: ${response.code}")
 
+                                    // 2. Let the Server Header override only if it provides a stronger match
                                     val contentType = response.header("Content-Type")?.lowercase() ?: ""
                                     if (contentType.contains("png")) { mimeType = "image/png"; extension = ".png" }
                                     else if (contentType.contains("webp")) { mimeType = "image/webp"; extension = ".webp" }
                                     else if (contentType.contains("gif")) { mimeType = "image/gif"; extension = ".gif" }
+                                    else if (contentType.contains("jpeg") && extension != ".jpeg") { mimeType = "image/jpeg"; extension = ".jpg" }
 
                                     responseStream = response.body?.byteStream()
                                     responseToClose = response
@@ -305,10 +340,12 @@ class ScraperService : Service() {
                                     connection.readTimeout = 10000
                                     connection.connect()
 
+                                    // 2. Let the Server Header override only if it provides a stronger match
                                     val contentType = connection.contentType?.lowercase() ?: ""
                                     if (contentType.contains("png")) { mimeType = "image/png"; extension = ".png" }
                                     else if (contentType.contains("webp")) { mimeType = "image/webp"; extension = ".webp" }
                                     else if (contentType.contains("gif")) { mimeType = "image/gif"; extension = ".gif" }
+                                    else if (contentType.contains("jpeg") && extension != ".jpeg") { mimeType = "image/jpeg"; extension = ".jpg" }
 
                                     responseStream = connection.inputStream
                                     connectionToDisconnect = connection
@@ -322,7 +359,7 @@ class ScraperService : Service() {
                                     applicationContext.contentResolver.openOutputStream(currentFile.uri)?.use { outStream ->
                                         responseStream.copyTo(outStream)
                                     }
-                                    ScrapeState.log("  > Downloaded Fallback Image: $safeImageName")
+                                    ScrapeState.log("  > Downloaded Page: $safeImageName")
                                 }
                             } finally {
                                 responseToClose?.close()
@@ -355,7 +392,7 @@ class ScraperService : Service() {
                                     }
                                 }
                                 bitmap.recycle()
-                                ScrapeState.log("  > Captured Canvas (PNG->WEBP): $safeImageName")
+                                ScrapeState.log("  > Captured Canvas DRM (PNG->WEBP): $safeImageName")
                             } else {
                                 throw Exception("Bitmap capture returned null")
                             }
@@ -402,44 +439,6 @@ class ScraperService : Service() {
                 }
             }
         }
-
-        if (zipOnSuccess && failedChapters == 0 && perfectlyDownloaded > 0 && !ScrapeState.isCancelled.value) {
-            ScrapeState.log("[System] No errors detected! Compressing folders to .zip...")
-            if (seriesDir != null) {
-                try {
-                    val zipFileName = "MangaScrape_${seriesTitle}_${System.currentTimeMillis()}.zip"
-                    val zipFile = seriesDir.createFile("application/zip", zipFileName)
-
-                    if (zipFile != null) {
-                        withContext(Dispatchers.IO) {
-                            applicationContext.contentResolver.openOutputStream(zipFile.uri)?.use { os ->
-                                ZipOutputStream(BufferedOutputStream(os)).use { zos ->
-                                    for (chapterDir in seriesDir.listFiles()) {
-                                        if (chapterDir.isDirectory) {
-                                            for (imageFile in chapterDir.listFiles()) {
-                                                if (imageFile.isFile && imageFile.name != null) {
-                                                    val entry = ZipEntry("${chapterDir.name}/${imageFile.name}")
-                                                    zos.putNextEntry(entry)
-                                                    applicationContext.contentResolver.openInputStream(imageFile.uri)?.use { ins ->
-                                                        ins.copyTo(zos)
-                                                    }
-                                                    zos.closeEntry()
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        ScrapeState.log("[Success] Successfully created zip: $zipFileName")
-                    } else {
-                        ScrapeState.log("[Warn] Warning: Failed to create zip file.")
-                    }
-                } catch (e: Exception) {
-                    ScrapeState.log("[Error] Zipping failed: ${e.message}")
-                }
-            }
-        }
     }
 
     private suspend fun checkPauseOrCancel(): Boolean {
@@ -481,6 +480,7 @@ class ScraperService : Service() {
     }
 
     private fun injectExtractionScript() {
+        // UPDATED: Stripped canvas fallback and enforces URL return to completely bypass zero-dimension background bugs!
         val js = """
             javascript:(function() {
                 var expectedTotal = -1;
@@ -507,13 +507,12 @@ class ScraperService : Service() {
                 var stuckCounter = 0;
 
                 var scrollInterval = setInterval(function() {
-                    window.scrollBy(0, window.innerHeight * 0.8);
+                    window.scrollBy(0, window.innerHeight > 0 ? window.innerHeight * 0.8 : 1000);
                     
                     var currentScrollY = window.scrollY;
                     if (Math.abs(currentScrollY - lastScrollY) < 5) {
                         stuckCounter++;
                         
-                        // Jiggle logic
                         if (stuckCounter % 2 === 0) {
                             window.scrollBy(0, -400);
                             setTimeout(function() { window.scrollBy(0, 400); }, 150);
@@ -567,27 +566,7 @@ class ScraperService : Service() {
                         if (el.tagName.toLowerCase() === 'img') {
                              var srcUrl = el.src || el.getAttribute('src') || "";
                              if (srcUrl && !srcUrl.includes('ajax-loader')) {
-                                 var hasUnderscoreDomain = false;
-                                 try {
-                                     var urlObj = new URL(srcUrl);
-                                     hasUnderscoreDomain = urlObj.hostname.includes('_');
-                                 } catch(e) {}
-                                 
-                                 if (hasUnderscoreDomain) {
-                                     var rect = el.getBoundingClientRect();
-                                     var x = rect.left + window.scrollX;
-                                     var y = rect.top + window.scrollY;
-                                     var w = rect.width;
-                                     var h = rect.height;
-                                     
-                                     if (w > 0 && h > 0) {
-                                         results.push({ type: 'canvas_rect', x: x, y: y, w: w, h: h });
-                                     } else {
-                                         results.push({ type: 'error', data: 'Image dimensions are 0' });
-                                     }
-                                 } else {
-                                     results.push({ type: 'url', data: srcUrl });
-                                 }
+                                 results.push({ type: 'url', data: srcUrl }); // Forces URL! Let OkHttp fallback handle errors!
                              }
                         } else if (el.tagName.toLowerCase() === 'canvas') {
                              var rect = el.getBoundingClientRect();
@@ -595,7 +574,6 @@ class ScraperService : Service() {
                              var y = rect.top + window.scrollY;
                              var w = rect.width;
                              var h = rect.height;
-                             
                              if (w > 0 && h > 0) {
                                  results.push({ type: 'canvas_rect', x: x, y: y, w: w, h: h });
                              } else {
@@ -653,7 +631,6 @@ class ScraperService : Service() {
     }
 
     override fun onDestroy() {
-        // Release WakeLock when the service completely stops
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()

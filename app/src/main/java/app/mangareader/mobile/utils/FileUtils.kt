@@ -5,6 +5,9 @@ import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import app.mangareader.mobile.data.MangaChapter
 import app.mangareader.mobile.data.MangaSeries
+import app.mangareader.mobile.data.MangaSeriesCache
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -13,7 +16,32 @@ import org.apache.commons.compress.archivers.zip.ZipFile as CommonsZipFile
 
 object FileUtils {
 
-    fun scanMangaFolders(context: Context, rootUri: Uri): List<MangaSeries> {
+    fun getCachedLibrary(context: Context, rootUri: Uri): List<MangaSeries> {
+        val file = File(context.cacheDir, "lib_cache_${rootUri.toString().hashCode()}.json")
+        if (!file.exists()) return emptyList()
+        try {
+            val json = file.readText()
+            val type = object : TypeToken<List<MangaSeriesCache>>() {}.type
+            val cacheList: List<MangaSeriesCache> = Gson().fromJson(json, type)
+
+            return cacheList.map {
+                val folderUri = Uri.parse(it.folderUriStr)
+                MangaSeries(
+                    title = it.title,
+                    folderUri = folderUri,
+                    // FIX: Reconstruct DocumentFile instantly from the cached URI.
+                    // Bypasses the slow `findFile` fallback in MainActivity and fixes the .zip extension mismatch!
+                    documentFile = DocumentFile.fromTreeUri(context, folderUri),
+                    downloadTimestamp = it.lastModified,
+                    coverUri = it.coverUriStr?.let { uri -> Uri.parse(uri) }
+                )
+            }
+        } catch (e: Exception) {
+            return emptyList()
+        }
+    }
+
+    fun syncLibrary(context: Context, rootUri: Uri): List<MangaSeries> {
         val rootFolder = DocumentFile.fromTreeUri(context, rootUri) ?: return emptyList()
         val list = mutableListOf<MangaSeries>()
 
@@ -21,14 +49,24 @@ object FileUtils {
             val isZip = file.name?.endsWith(".zip", ignoreCase = true) == true
             if (file.isDirectory || isZip) {
                 val cleanTitle = if (isZip) file.name!!.dropLast(4) else file.name ?: "Unknown"
+                val cover = getCoverImage(context, file)
                 list.add(MangaSeries(
                     title = cleanTitle,
                     folderUri = file.uri,
                     documentFile = file,
-                    downloadTimestamp = file.lastModified()
+                    downloadTimestamp = file.lastModified(),
+                    coverUri = cover
                 ))
             }
         }
+
+        // Save output JSON unique to this specific drive/folder URI
+        try {
+            val cacheList = list.map { MangaSeriesCache(it.title, it.folderUri.toString(), it.downloadTimestamp, it.coverUri?.toString()) }
+            val file = File(context.cacheDir, "lib_cache_${rootUri.toString().hashCode()}.json")
+            file.writeText(Gson().toJson(cacheList))
+        } catch (e: Exception) {}
+
         return list
     }
 
@@ -46,7 +84,6 @@ object FileUtils {
         } else if (seriesFile.name?.endsWith(".zip", true) == true) {
             var fastMethodSuccess = false
 
-            // INSTANT EXTRACTION via Apache Commons Compress (1.5GB+ ZIPs in milliseconds)
             try {
                 context.contentResolver.openFileDescriptor(seriesFile.uri, "r")?.use { pfd ->
                     FileInputStream(pfd.fileDescriptor).channel.use { channel ->
@@ -68,7 +105,6 @@ object FileUtils {
                 }
             } catch (e: Exception) { e.printStackTrace() }
 
-            // Slow Fallback (for older Android versions without PFD support)
             if (!fastMethodSuccess) {
                 try {
                     context.contentResolver.openInputStream(seriesFile.uri)?.use { ips ->

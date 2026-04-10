@@ -48,8 +48,8 @@ fun ScraperScreen(onBackClick: () -> Unit) {
     var url by remember { mutableStateOf("https://www.mangago.me/read-manga/threads_of_love/") }
     var seriesTitle by remember { mutableStateOf("") }
     var startChapter by remember { mutableStateOf("1") }
+    var baseChapterName by remember { mutableStateOf("") } // NEW: Base Chapter Offset Name
     var maxChapters by remember { mutableStateOf("") }
-    var zipOnSuccess by remember { mutableStateOf(true) }
     var showLoginDialog by remember { mutableStateOf(false) }
     var currentDialogUrl by remember { mutableStateOf("") }
     var showStartWarning by remember { mutableStateOf(false) }
@@ -69,10 +69,10 @@ fun ScraperScreen(onBackClick: () -> Unit) {
         ScrapeState.isCancelled.value = false
         val serviceIntent = Intent(context, ScraperService::class.java).apply {
             putExtra("URL", url)
-            putExtra("SERIES_TITLE", seriesTitle.ifEmpty { "Unknown_Series" })
+            putExtra("SERIES_TITLE", seriesTitle.trim())
             putExtra("START_CHAPTER", startChapter.toIntOrNull() ?: 1)
+            putExtra("BASE_CHAPTER", baseChapterName.toIntOrNull() ?: startChapter.toIntOrNull() ?: 1)
             putExtra("MAX_CHAPTERS", maxChapters.toIntOrNull() ?: 99999)
-            putExtra("ZIP_ON_SUCCESS", zipOnSuccess)
             putExtra("COOKIE", validCookie)
         }
         ContextCompat.startForegroundService(context, serviceIntent)
@@ -115,7 +115,7 @@ fun ScraperScreen(onBackClick: () -> Unit) {
 
             OutlinedTextField(
                 value = seriesTitle, onValueChange = { seriesTitle = it },
-                label = { Text("Series Title (Creates Master Folder)") },
+                label = { Text("Series Title (Leave blank to save directly)") },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !isScraping
             )
@@ -124,6 +124,14 @@ fun ScraperScreen(onBackClick: () -> Unit) {
                 OutlinedTextField(
                     value = startChapter, onValueChange = { startChapter = it },
                     label = { Text("Start Ch.") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f),
+                    enabled = !isScraping
+                )
+                // NEW INPUT: Decouples Start Index from Output Folder Name
+                OutlinedTextField(
+                    value = baseChapterName, onValueChange = { baseChapterName = it },
+                    label = { Text("Base Number") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.weight(1f),
                     enabled = !isScraping
@@ -192,7 +200,7 @@ fun ScraperScreen(onBackClick: () -> Unit) {
             ) {
                 items(logs) { logMsg ->
                     Text(text = logMsg, color = Color.Green, fontSize = 12.sp)
-                    Divider(color = Color.DarkGray, thickness = 0.5.dp)
+                    HorizontalDivider(color = Color.DarkGray, thickness = 0.5.dp)
                 }
             }
         }

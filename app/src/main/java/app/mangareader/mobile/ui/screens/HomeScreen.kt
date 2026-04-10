@@ -1,7 +1,6 @@
 package app.mangareader.mobile.ui.screens
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.webkit.CookieManager
 import android.webkit.WebView
@@ -27,12 +26,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
-import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
-import app.mangareader.mobile.ScraperService
 import app.mangareader.mobile.data.MangaSeries
 import app.mangareader.mobile.utils.FileUtils
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private val DarkBlueStart = Color(0xFF0B101E)
@@ -56,24 +54,32 @@ fun HomeScreen(
     onScraperClick: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     var mangaList by remember { mutableStateOf<List<MangaSeries>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
     var sortType by remember { mutableStateOf(SortType.DATE_DESC) }
     var isSortMenuExpanded by remember { mutableStateOf(false) }
 
-    var showScraperDialog by remember { mutableStateOf(false) }
-    var scrapeUrl by remember { mutableStateOf("") }
-    var scrapeTitle by remember { mutableStateOf("") }
-    var isBrowserVisible by remember { mutableStateOf(false) }
+    var isSyncing by remember { mutableStateOf(false) }
     var validCookie by remember { mutableStateOf("") }
-
+    var isBrowserVisible by remember { mutableStateOf(false) }
     var isMenuExpanded by remember { mutableStateOf(false) }
+
     val headerFooterGradient = Brush.horizontalGradient(colors = listOf(DarkBlueStart, PurpleEnd))
 
+    // JSON Startup Cache Hook
     LaunchedEffect(rootFolderUri) {
+        isSyncing = true
         withContext(Dispatchers.IO) {
-            mangaList = FileUtils.scanMangaFolders(context, rootFolderUri)
+            val cached = FileUtils.getCachedLibrary(context, rootFolderUri)
+            if (cached.isNotEmpty()) {
+                mangaList = cached
+            } else {
+                mangaList = FileUtils.syncLibrary(context, rootFolderUri)
+            }
         }
+        isSyncing = false
     }
 
     val filteredList by remember {
@@ -105,23 +111,36 @@ fun HomeScreen(
                         fontSize = 24.sp,
                         modifier = Modifier.clickable { onThemeToggle() }
                     )
-                    Box {
-                        Text(
-                            text = "⚙️",
-                            fontSize = 24.sp,
-                            modifier = Modifier.clickable { isMenuExpanded = true }
-                        )
-                        DropdownMenu(expanded = isMenuExpanded, onDismissRequest = { isMenuExpanded = false }) {
-                            DropdownMenuItem(
-                                text = { Text("Resync Files") },
-                                onClick = { isMenuExpanded = false; onResyncClick() },
-                                leadingIcon = { Text("🔄", fontSize = 16.sp) }
+
+                    if (isSyncing) {
+                        CircularProgressIndicator(color = Color.White, modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    } else {
+                        Box {
+                            Text(
+                                text = "⚙️",
+                                fontSize = 24.sp,
+                                modifier = Modifier.clickable { isMenuExpanded = true }
                             )
-                            DropdownMenuItem(
-                                text = { Text("Fetch Series") },
-                                onClick = { isMenuExpanded = false; onScraperClick() },
-                                leadingIcon = { Text("⚙️", fontSize = 16.sp) }
-                            )
+                            DropdownMenu(expanded = isMenuExpanded, onDismissRequest = { isMenuExpanded = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("Resync Files") },
+                                    onClick = {
+                                        isMenuExpanded = false
+                                        scope.launch(Dispatchers.IO) {
+                                            isSyncing = true
+                                            mangaList = FileUtils.syncLibrary(context, rootFolderUri)
+                                            isSyncing = false
+                                        }
+                                        onResyncClick()
+                                    },
+                                    leadingIcon = { Text("🔄", fontSize = 16.sp) }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Fetch Series") },
+                                    onClick = { isMenuExpanded = false; onScraperClick() },
+                                    leadingIcon = { Text("⚙️", fontSize = 16.sp) }
+                                )
+                            }
                         }
                     }
                 }
@@ -207,47 +226,6 @@ fun HomeScreen(
                 }
             }
         }
-
-        if (showScraperDialog) {
-            AlertDialog(
-                onDismissRequest = { showScraperDialog = false },
-                title = { Text("Fetch New Series") },
-                text = {
-                    Column {
-                        Button(
-                            onClick = { isBrowserVisible = true },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6200EE))
-                        ) { Text("1. Login (Optional)") }
-
-                        if (validCookie.isNotEmpty()) Text("✅ Login Saved!", color = Color.Green, fontSize = 12.sp)
-
-                        Spacer(modifier = Modifier.height(15.dp))
-                        TextField(value = scrapeUrl, onValueChange = { scrapeUrl = it }, placeholder = { Text("URL (mangago.me/...)") })
-                        Spacer(modifier = Modifier.height(8.dp))
-                        TextField(value = scrapeTitle, onValueChange = { scrapeTitle = it }, placeholder = { Text("Manga Title (e.g. Naruto)") })
-
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Text("This will run silently in the background. You can read while it downloads!", fontSize = 11.sp, color = Color.Gray)
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        enabled = scrapeUrl.isNotEmpty() && scrapeTitle.isNotEmpty(),
-                        onClick = {
-                            val intent = Intent(context, ScraperService::class.java).apply {
-                                putExtra("URL", scrapeUrl)
-                                putExtra("SERIES_TITLE", scrapeTitle)
-                                putExtra("COOKIE", validCookie)
-                            }
-                            ContextCompat.startForegroundService(context, intent)
-                            showScraperDialog = false
-                        }
-                    ) { Text("Start Background Fetch") }
-                },
-                dismissButton = { Button(onClick = { showScraperDialog = false }) { Text("Cancel") } }
-            )
-        }
     }
 }
 
@@ -255,20 +233,17 @@ fun HomeScreen(
 fun MangaCard(manga: MangaSeries, onClick: () -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("manga_progress", Context.MODE_PRIVATE) }
-
-    var coverUri by remember { mutableStateOf<Uri?>(null) }
     var lastChapter by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(manga.folderUri) {
         lastChapter = prefs.getInt("last_chapter_${manga.title}", 0) + 1
-        withContext(Dispatchers.IO) { coverUri = FileUtils.getCoverImage(context, manga.documentFile) }
     }
 
     Box(
         modifier = Modifier.width(110.dp).height(160.dp).clip(RoundedCornerShape(8.dp)).clickable { onClick() }
     ) {
-        if (coverUri != null) {
-            AsyncImage(model = coverUri, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+        if (manga.coverUri != null) {
+            AsyncImage(model = manga.coverUri, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
         } else {
             Box(modifier = Modifier.fillMaxSize().background(Color.DarkGray), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(color = Color.White, modifier = Modifier.size(24.dp))

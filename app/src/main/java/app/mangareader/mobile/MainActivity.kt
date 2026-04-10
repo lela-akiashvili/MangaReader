@@ -40,7 +40,7 @@ class MainActivity : ComponentActivity() {
                 var selectedUri by remember { mutableStateOf<Uri?>(initialUri) }
 
                 var selectedSeriesTitle by remember { mutableStateOf("") }
-                var selectedSeriesFile by remember { mutableStateOf<DocumentFile?>(null) } // Passes doc securely
+                var selectedSeriesFile by remember { mutableStateOf<DocumentFile?>(null) }
 
                 val folderPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
                     if (uri != null) {
@@ -74,7 +74,6 @@ class MainActivity : ComponentActivity() {
                             HomeScreen(
                                 rootFolderUri = selectedUri!!,
                                 onSeriesClick = { series ->
-                                    // Fix: Do NOT fetch chapters here, let ReaderScreen handle it in background
                                     selectedSeriesTitle = series.title
                                     selectedSeriesFile = series.documentFile
                                     currentScreen = "reader"
@@ -90,10 +89,18 @@ class MainActivity : ComponentActivity() {
                         ScraperScreen(onBackClick = { currentScreen = "home" })
                     }
                     "reader" -> {
-                        if (selectedSeriesFile != null) {
+                        var finalFile = selectedSeriesFile
+
+                        // Dynamically re-fetch the DocumentFile if it was omitted from the JSON cache
+                        if (finalFile == null && selectedUri != null) {
+                            val root = DocumentFile.fromTreeUri(this, selectedUri!!)
+                            finalFile = root?.findFile(selectedSeriesTitle)
+                        }
+
+                        if (finalFile != null) {
                             ReaderScreen(
                                 seriesTitle = selectedSeriesTitle,
-                                seriesFile = selectedSeriesFile!!, // Fix: Pass DocumentFile to offload logic
+                                seriesFile = finalFile,
                                 onBackClick = { currentScreen = "home" }
                             )
                         }
