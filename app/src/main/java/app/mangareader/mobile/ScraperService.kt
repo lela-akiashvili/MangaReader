@@ -28,7 +28,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.InputStream
-import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
 import kotlin.coroutines.resume
@@ -70,7 +69,7 @@ class ScraperService : Service() {
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
 
-                // UPDATED: Massive 4K Viewport to Guarantee Highest Res Canvas captures!
+                // Massive 4K Viewport to Guarantee Highest Res Canvas captures
                 layoutParams = ViewGroup.LayoutParams(2560, 3500)
                 measure(
                     View.MeasureSpec.makeMeasureSpec(2560, View.MeasureSpec.EXACTLY),
@@ -202,7 +201,6 @@ class ScraperService : Service() {
             updateNotification("Scraping $folderName...")
             ScrapeState.log("\n[Chapter ${index + 1}/${selectedChapters.size}] Starting: $folderName")
 
-            // UPDATED: 4-Try Polling loop for handling background rendering interruptions!
             var jsonResult = ""
             var imagesList = JSONArray()
             var totalImages = 0
@@ -220,7 +218,7 @@ class ScraperService : Service() {
                 totalImages = imagesList.length()
 
                 if (totalImages > 0 && imagesList.optJSONObject(0)?.optString("type") != "error") {
-                    break // Pages rendered beautifully!
+                    break
                 }
 
                 htmlAttempts++
@@ -291,7 +289,7 @@ class ScraperService : Service() {
                             var mimeType = "image/jpeg"
                             var extension = ".jpg"
 
-                            // 1. Extract the exact extension from the URL string
+                            // 1. Extract exact extension from URL
                             val urlExt = data.substringAfterLast('.', "").substringBefore("?").substringBefore("#").lowercase()
                             when (urlExt) {
                                 "png" -> { mimeType = "image/png"; extension = ".png" }
@@ -303,53 +301,62 @@ class ScraperService : Service() {
                             }
 
                             var responseToClose: Response? = null
-                            var connectionToDisconnect: HttpURLConnection? = null
 
                             try {
-                                try {
-                                    val request = Request.Builder()
-                                        .url(data)
-                                        .header("Cookie", cookies)
-                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                                var clientToUse = okHttpClient
+                                var finalUrl = data
+                                var usedDomainMasking = false
+
+                                val parsedUrl = URL(data)
+                                val originalHost = parsedUrl.host
+
+                                // THE CLOUDFLARE UNDERSCORE BYPASS (DOMAIN MASKING)
+                                if (originalHost.contains("_")) {
+                                    usedDomainMasking = true
+                                    val decoyHost = originalHost.replace("_", "-")
+                                    finalUrl = data.replaceFirst(originalHost, decoyHost)
+
+                                    clientToUse = okHttpClient.newBuilder()
+                                        .dns(object : okhttp3.Dns {
+                                            override fun lookup(hostname: String): List<InetAddress> {
+                                                if (hostname == decoyHost) {
+                                                    return okhttp3.Dns.SYSTEM.lookup(originalHost)
+                                                }
+                                                return okhttp3.Dns.SYSTEM.lookup(hostname)
+                                            }
+                                        })
+                                        .hostnameVerifier { hostname, session ->
+                                            if (hostname == decoyHost) {
+                                                // Validate Cloudflare cert explicitly against the true original host
+                                                javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier().verify(originalHost, session)
+                                            } else {
+                                                javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier().verify(hostname, session)
+                                            }
+                                        }
                                         .build()
-
-                                    val response = okHttpClient.newCall(request).execute()
-                                    if (!response.isSuccessful) throw Exception("HTTP Error: ${response.code}")
-
-                                    // 2. Let the Server Header override only if it provides a stronger match
-                                    val contentType = response.header("Content-Type")?.lowercase() ?: ""
-                                    if (contentType.contains("png")) { mimeType = "image/png"; extension = ".png" }
-                                    else if (contentType.contains("webp")) { mimeType = "image/webp"; extension = ".webp" }
-                                    else if (contentType.contains("gif")) { mimeType = "image/gif"; extension = ".gif" }
-                                    else if (contentType.contains("jpeg") && extension != ".jpeg") { mimeType = "image/jpeg"; extension = ".jpg" }
-
-                                    responseStream = response.body?.byteStream()
-                                    responseToClose = response
-
-                                } catch (e: IllegalArgumentException) {
-                                    val javaUrl = URL(data)
-                                    val host = javaUrl.host
-                                    val ip = InetAddress.getByName(host).hostAddress
-                                    val ipUrl = data.replaceFirst(host, ip)
-
-                                    val connection = URL(ipUrl).openConnection() as HttpURLConnection
-                                    connection.setRequestProperty("Host", host)
-                                    connection.setRequestProperty("Cookie", cookies)
-                                    connection.setRequestProperty("User-Agent", "Mozilla/5.0")
-                                    connection.connectTimeout = 10000
-                                    connection.readTimeout = 10000
-                                    connection.connect()
-
-                                    // 2. Let the Server Header override only if it provides a stronger match
-                                    val contentType = connection.contentType?.lowercase() ?: ""
-                                    if (contentType.contains("png")) { mimeType = "image/png"; extension = ".png" }
-                                    else if (contentType.contains("webp")) { mimeType = "image/webp"; extension = ".webp" }
-                                    else if (contentType.contains("gif")) { mimeType = "image/gif"; extension = ".gif" }
-                                    else if (contentType.contains("jpeg") && extension != ".jpeg") { mimeType = "image/jpeg"; extension = ".jpg" }
-
-                                    responseStream = connection.inputStream
-                                    connectionToDisconnect = connection
                                 }
+
+                                val requestBuilder = Request.Builder()
+                                    .url(finalUrl)
+                                    .header("Cookie", cookies)
+                                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+                                if (usedDomainMasking) {
+                                    requestBuilder.header("Host", originalHost)
+                                }
+
+                                val response = clientToUse.newCall(requestBuilder.build()).execute()
+                                if (!response.isSuccessful) throw Exception("HTTP Error: ${response.code}")
+
+                                // 2. Check Server Header overrides
+                                val contentType = response.header("Content-Type")?.lowercase() ?: ""
+                                if (contentType.contains("png")) { mimeType = "image/png"; extension = ".png" }
+                                else if (contentType.contains("webp")) { mimeType = "image/webp"; extension = ".webp" }
+                                else if (contentType.contains("gif")) { mimeType = "image/gif"; extension = ".gif" }
+                                else if (contentType.contains("jpeg") && extension != ".jpeg") { mimeType = "image/jpeg"; extension = ".jpg" }
+
+                                responseStream = response.body?.byteStream()
+                                responseToClose = response
 
                                 if (responseStream != null) {
                                     val safeImageName = "${chapter.name}_${String.format("%03d", imgDisplayNum)}$extension"
@@ -357,13 +364,12 @@ class ScraperService : Service() {
                                         ?: throw Exception("Failed to create file")
 
                                     applicationContext.contentResolver.openOutputStream(currentFile.uri)?.use { outStream ->
-                                        responseStream.copyTo(outStream)
+                                        responseStream?.copyTo(outStream)
                                     }
                                     ScrapeState.log("  > Downloaded Page: $safeImageName")
                                 }
                             } finally {
                                 responseToClose?.close()
-                                connectionToDisconnect?.disconnect()
                             }
 
                         } else if (type == "canvas_rect") {
@@ -392,7 +398,7 @@ class ScraperService : Service() {
                                     }
                                 }
                                 bitmap.recycle()
-                                ScrapeState.log("  > Captured Canvas DRM (PNG->WEBP): $safeImageName")
+                                ScrapeState.log("  > Captured Canvas DRM: $safeImageName")
                             } else {
                                 throw Exception("Bitmap capture returned null")
                             }
@@ -480,7 +486,6 @@ class ScraperService : Service() {
     }
 
     private fun injectExtractionScript() {
-        // UPDATED: Stripped canvas fallback and enforces URL return to completely bypass zero-dimension background bugs!
         val js = """
             javascript:(function() {
                 var expectedTotal = -1;
@@ -566,7 +571,7 @@ class ScraperService : Service() {
                         if (el.tagName.toLowerCase() === 'img') {
                              var srcUrl = el.src || el.getAttribute('src') || "";
                              if (srcUrl && !srcUrl.includes('ajax-loader')) {
-                                 results.push({ type: 'url', data: srcUrl }); // Forces URL! Let OkHttp fallback handle errors!
+                                 results.push({ type: 'url', data: srcUrl });
                              }
                         } else if (el.tagName.toLowerCase() === 'canvas') {
                              var rect = el.getBoundingClientRect();
