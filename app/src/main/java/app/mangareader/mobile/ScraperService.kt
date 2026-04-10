@@ -36,6 +36,7 @@ import kotlin.coroutines.suspendCoroutine
 class ScraperService : Service() {
 
     private val CHANNEL_ID = "ScraperChannel"
+    private val COMPLETION_CHANNEL_ID = "ScraperCompletionChannel"
     private val NOTIFICATION_ID = 1
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -433,8 +434,6 @@ class ScraperService : Service() {
             }
         }
 
-        updateNotification("Scraping Complete!")
-
         if (!ScrapeState.isCancelled.value) {
             ScrapeState.log("\n>>> ALL CHAPTERS PROCESSED SUCCESSFULLY <<<")
 
@@ -443,7 +442,43 @@ class ScraperService : Service() {
                 for (issue in incompleteList) {
                     ScrapeState.log(" > $issue")
                 }
+                sendCompletionNotification("Scraping Finished (With Errors)", "Completed $seriesTitle, but $failedChapters chapters had missing pages.")
+            } else {
+                val titleOrFallback = seriesTitle.ifBlank { "requested series" }
+                sendCompletionNotification("Scraping Complete!", "Successfully downloaded $titleOrFallback.")
             }
+        } else {
+            sendCompletionNotification("Scraping Stopped", "Download was cancelled for $seriesTitle.")
+        }
+    }
+
+    private fun sendCompletionNotification(title: String, text: String) {
+        wakeScreen()
+
+        val notification = NotificationCompat.Builder(this, COMPLETION_CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_save)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .build()
+
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(2, notification)
+    }
+
+    private fun wakeScreen() {
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            @Suppress("DEPRECATION")
+            val wakeLock = powerManager.newWakeLock(
+                PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
+                "MangaScraper::CompletionWakeUp"
+            )
+            wakeLock.acquire(3000) // Temporarily turn on screen for 3 seconds
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -611,13 +646,26 @@ class ScraperService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
+            val manager = getSystemService(NotificationManager::class.java)
+
+            // Ongoing (Silent) Channel
+            val ongoingChannel = NotificationChannel(
                 CHANNEL_ID,
-                "Manga Scraper Service",
+                "Manga Scraper Running",
                 NotificationManager.IMPORTANCE_LOW
             )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(ongoingChannel)
+
+            // Completed (Loud/Wake) Channel
+            val completionChannel = NotificationChannel(
+                COMPLETION_CHANNEL_ID,
+                "Manga Scraper Completed",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Alerts when a manga finishes downloading"
+                enableVibration(true)
+            }
+            manager.createNotificationChannel(completionChannel)
         }
     }
 
