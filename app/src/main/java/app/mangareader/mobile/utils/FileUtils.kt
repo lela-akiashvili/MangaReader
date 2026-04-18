@@ -1,7 +1,10 @@
 package app.mangareader.mobile.utils
 
+import android.content.ContentResolver
 import android.content.Context
+import android.database.Cursor
 import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import app.mangareader.mobile.data.MangaChapter
 import app.mangareader.mobile.data.MangaSeries
@@ -16,189 +19,179 @@ import org.apache.commons.compress.archivers.zip.ZipFile as CommonsZipFile
 
 object FileUtils {
 
+    /**
+     * Optimized folder query using raw ContentResolver.
+     * Bypasses the slow DocumentFile.listFiles() overhead.
+     */
+    private fun queryChildren(context: Context, parentUri: Uri): List<Pair<Uri, String>> {
+        val result = mutableListOf<Pair<Uri, String>>()
+        try {
+            // Safely extract the Document ID whether it's a Tree URI or a standard URI
+            val docId = if (DocumentsContract.isDocumentUri(context, parentUri)) {
+                DocumentsContract.getDocumentId(parentUri)
+            } else {
+                DocumentsContract.getTreeDocumentId(parentUri)
+            }
+
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(parentUri, docId)
+
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME
+            )
+
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val childDocId = cursor.getString(idIdx)
+                    val name = cursor.getString(nameIdx)
+                    val uri = DocumentsContract.buildDocumentUriUsingTree(parentUri, childDocId)
+                    result.add(uri to name)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return result
+    }
+
     fun getCachedLibrary(context: Context, rootUri: Uri): List<MangaSeries> {
         val file = File(context.cacheDir, "lib_cache_${rootUri.toString().hashCode()}.json")
         if (!file.exists()) return emptyList()
-        try {
+        return try {
             val json = file.readText()
             val type = object : TypeToken<List<MangaSeriesCache>>() {}.type
             val cacheList: List<MangaSeriesCache> = Gson().fromJson(json, type)
 
-            return cacheList.map {
+            cacheList.map {
                 val folderUri = Uri.parse(it.folderUriStr)
                 MangaSeries(
                     title = it.title,
                     folderUri = folderUri,
-                    // FIX: Reconstruct DocumentFile instantly from the cached URI.
-                    // Bypasses the slow `findFile` fallback in MainActivity and fixes the .zip extension mismatch!
                     documentFile = DocumentFile.fromTreeUri(context, folderUri),
                     downloadTimestamp = it.lastModified,
                     coverUri = it.coverUriStr?.let { uri -> Uri.parse(uri) }
                 )
             }
         } catch (e: Exception) {
-            return emptyList()
+            emptyList()
         }
     }
 
     fun syncLibrary(context: Context, rootUri: Uri): List<MangaSeries> {
-        val rootFolder = DocumentFile.fromTreeUri(context, rootUri) ?: return emptyList()
         val list = mutableListOf<MangaSeries>()
 
-        rootFolder.listFiles().forEach { file ->
-            val isZip = file.name?.endsWith(".zip", ignoreCase = true) == true
-            if (file.isDirectory || isZip) {
-                val cleanTitle = if (isZip) file.name!!.dropLast(4) else file.name ?: "Unknown"
-                val cover = getCoverImage(context, file)
-                list.add(MangaSeries(
-                    title = cleanTitle,
-                    folderUri = file.uri,
-                    documentFile = file,
-                    downloadTimestamp = file.lastModified(),
-                    coverUri = cover
-                ))
-            }
+        // Use optimized query instead of DocumentFile.listFiles()
+        val children = queryChildren(context, rootUri)
+
+        children.forEach { (uri, name) ->
+            val isZip = name.endsWith(".zip", ignoreCase = true)
+            val cleanTitle = if (isZip) name.dropLast(4) else name
+
+            // Optimization: Don't fetch covers during the initial heavy loop.
+            // This is what causes the "30 minute hang" on large drives.
+            list.add(MangaSeries(
+                title = cleanTitle,
+                folderUri = uri,
+                documentFile = DocumentFile.fromTreeUri(context, uri),
+                downloadTimestamp = System.currentTimeMillis()
+            ))
         }
 
-        // Save output JSON unique to this specific drive/folder URI
+        updateCacheFile(context, rootUri, list)
+        return list
+    }
+
+    fun updateCacheFile(context: Context, rootUri: Uri, list: List<MangaSeries>) {
         try {
             val cacheList = list.map { MangaSeriesCache(it.title, it.folderUri.toString(), it.downloadTimestamp, it.coverUri?.toString()) }
             val file = File(context.cacheDir, "lib_cache_${rootUri.toString().hashCode()}.json")
             file.writeText(Gson().toJson(cacheList))
         } catch (e: Exception) {}
+    }
 
-        return list
+    fun fetchCoverImage(context: Context, series: MangaSeries): Uri? {
+        val seriesFile = series.documentFile ?: return null
+        val cacheFile = File(context.cacheDir, "cover_${series.title.hashCode()}.jpg")
+        if (cacheFile.exists()) return Uri.fromFile(cacheFile)
+
+        try {
+            if (seriesFile.name?.endsWith(".zip", true) == true) {
+                // Seek into ZIP for the first image
+                context.contentResolver.openFileDescriptor(seriesFile.uri, "r")?.use { pfd ->
+                    FileInputStream(pfd.fileDescriptor).channel.use { channel ->
+                        CommonsZipFile.builder().setSeekableByteChannel(channel).get().use { zip ->
+                            val firstImgEntry = zip.entries.toList().firstOrNull {
+                                !it.isDirectory && isImageFile(it.name)
+                            }
+                            if (firstImgEntry != null) {
+                                FileOutputStream(cacheFile).use { fos ->
+                                    zip.getInputStream(firstImgEntry).use { it.copyTo(fos) }
+                                }
+                                return Uri.fromFile(cacheFile)
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Peek into the first folder of a nested series directory
+                val children = queryChildren(context, seriesFile.uri)
+                val firstFolder = children.firstOrNull() ?: return null
+
+                // Get images inside that first folder
+                val pages = queryChildren(context, firstFolder.first)
+                val firstPage = pages.find { isImageFile(it.second) }
+
+                if (firstPage != null) {
+                    context.contentResolver.openInputStream(firstPage.first)?.use { input ->
+                        FileOutputStream(cacheFile).use { output -> input.copyTo(output) }
+                    }
+                    return Uri.fromFile(cacheFile)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return null
     }
 
     fun getChapters(context: Context, seriesFile: DocumentFile): List<MangaChapter> {
         val list = mutableListOf<MangaChapter>()
 
-        if (seriesFile.isDirectory) {
-            val subDirs = seriesFile.listFiles().filter { it.isDirectory || it.name?.endsWith(".zip", true) == true }
-            if (subDirs.isNotEmpty()) {
-                subDirs.forEach { list.add(MangaChapter(it.name ?: "Unknown", it, null)) }
-            } else {
-                val hasImages = seriesFile.listFiles().any { isImageFile(it.name ?: "") }
-                if (hasImages) list.add(MangaChapter("Chapter 1", seriesFile, null))
-            }
-        } else if (seriesFile.name?.endsWith(".zip", true) == true) {
-            var fastMethodSuccess = false
-
+        if (seriesFile.name?.endsWith(".zip", true) == true) {
             try {
                 context.contentResolver.openFileDescriptor(seriesFile.uri, "r")?.use { pfd ->
                     FileInputStream(pfd.fileDescriptor).channel.use { channel ->
                         CommonsZipFile.builder().setSeekableByteChannel(channel).get().use { zip ->
-                            val chapterPaths = mutableSetOf<String>()
-                            zip.entries.toList().forEach { entry ->
-                                val normalizedName = entry.name.replace("\\", "/")
-                                if (!entry.isDirectory && isImageFile(normalizedName)) {
-                                    chapterPaths.add(normalizedName.substringBeforeLast("/", ""))
-                                }
+                            val paths = zip.entries.toList()
+                                .filter { !it.isDirectory && isImageFile(it.name) }
+                                .map { it.name.replace("\\", "/").substringBeforeLast("/", "") }
+                                .distinct()
+
+                            paths.forEach { path ->
+                                val displayName = path.substringAfterLast("/")
+                                list.add(MangaChapter(displayName, null, seriesFile, path))
                             }
-                            chapterPaths.forEach { folderPath ->
-                                val displayName = if (folderPath.isEmpty()) "Root Images" else folderPath.substringAfterLast("/")
-                                list.add(MangaChapter(displayName, null, seriesFile, folderPath))
-                            }
-                            fastMethodSuccess = true
                         }
                     }
                 }
-            } catch (e: Exception) { e.printStackTrace() }
-
-            if (!fastMethodSuccess) {
-                try {
-                    context.contentResolver.openInputStream(seriesFile.uri)?.use { ips ->
-                        ZipInputStream(ips).use { zis ->
-                            val chapterPaths = mutableSetOf<String>()
-                            var entry = zis.nextEntry
-                            while (entry != null) {
-                                val normalizedName = entry.name.replace("\\", "/")
-                                if (!entry.isDirectory && isImageFile(normalizedName)) {
-                                    chapterPaths.add(normalizedName.substringBeforeLast("/", ""))
-                                }
-                                zis.closeEntry()
-                                entry = zis.nextEntry
-                            }
-
-                            chapterPaths.forEach { folderPath ->
-                                val displayName = if (folderPath.isEmpty()) "Root Images" else folderPath.substringAfterLast("/")
-                                list.add(MangaChapter(displayName, null, seriesFile, folderPath))
-                            }
-                        }
-                    }
-                } catch (e: Exception) { e.printStackTrace() }
+            } catch (e: Exception) {}
+        } else {
+            val children = queryChildren(context, seriesFile.uri)
+            children.forEach { (uri, name) ->
+                list.add(MangaChapter(name, DocumentFile.fromTreeUri(context, uri), null))
             }
         }
 
-        val smartSort = compareBy<MangaChapter> { chapter ->
-            Regex("\\d+").find(chapter.name)?.value?.toIntOrNull() ?: 0
-        }.thenBy { it.name }
-
-        return list.sortedWith(smartSort)
-    }
-
-    fun getCoverImage(context: Context, seriesFile: DocumentFile): Uri? {
-        try {
-            val cacheFile = File(context.cacheDir, "cover_${seriesFile.name}.jpg")
-            if (cacheFile.exists()) return Uri.fromFile(cacheFile)
-
-            if (seriesFile.isDirectory) {
-                val firstChap = seriesFile.listFiles()
-                    .filter { it.isDirectory || it.name?.endsWith(".zip", true) == true }
-                    .minByOrNull { it.name ?: "" }
-
-                val targetFolder = firstChap ?: seriesFile
-                val img = targetFolder.listFiles().find { isImageFile(it.name ?: "") }
-                return img?.uri
-            } else if (seriesFile.name?.endsWith(".zip", true) == true) {
-                var fastMethodSuccess = false
-
-                try {
-                    context.contentResolver.openFileDescriptor(seriesFile.uri, "r")?.use { pfd ->
-                        FileInputStream(pfd.fileDescriptor).channel.use { channel ->
-                            CommonsZipFile.builder().setSeekableByteChannel(channel).get().use { zip ->
-                                val firstImgEntry = zip.entries.toList().firstOrNull {
-                                    !it.isDirectory && isImageFile(it.name)
-                                }
-                                if (firstImgEntry != null) {
-                                    FileOutputStream(cacheFile).use { fos ->
-                                        zip.getInputStream(firstImgEntry).use { it.copyTo(fos) }
-                                    }
-                                    fastMethodSuccess = true
-                                    return Uri.fromFile(cacheFile)
-                                }
-                            }
-                        }
-                    }
-                } catch (e: Exception) { e.printStackTrace() }
-
-                if (!fastMethodSuccess) {
-                    context.contentResolver.openInputStream(seriesFile.uri)?.use { ips ->
-                        ZipInputStream(ips).use { zis ->
-                            var entry = zis.nextEntry
-                            while (entry != null) {
-                                if (!entry.isDirectory && isImageFile(entry.name)) {
-                                    FileOutputStream(cacheFile).use { fos -> zis.copyTo(fos) }
-                                    return Uri.fromFile(cacheFile)
-                                }
-                                entry = zis.nextEntry
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) { e.printStackTrace() }
-        return null
+        return list.sortedWith(compareBy({
+            Regex("\\d+").find(it.name)?.value?.toIntOrNull() ?: 0
+        }, { it.name }))
     }
 
     fun isImageFile(name: String): Boolean {
         val lower = name.lowercase()
-        return lower.endsWith(".jpg") ||
-                lower.endsWith(".png") ||
-                lower.endsWith(".webp") ||
-                lower.endsWith(".jpeg") ||
-                lower.endsWith(".gif") ||
-                lower.endsWith(".bmp") ||
-                lower.endsWith(".avif")
+        return lower.endsWith(".jpg") || lower.endsWith(".png") || lower.endsWith(".webp") ||
+                lower.endsWith(".jpeg") || lower.endsWith(".avif")
     }
 }

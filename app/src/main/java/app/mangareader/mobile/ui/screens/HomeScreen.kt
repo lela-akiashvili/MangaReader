@@ -68,31 +68,72 @@ fun HomeScreen(
 
     val headerFooterGradient = Brush.horizontalGradient(colors = listOf(DarkBlueStart, PurpleEnd))
 
+    // Background function to lazily load covers without blocking the UI
+    suspend fun processMissingCovers(listToProcess: List<MangaSeries>) {
+        withContext(Dispatchers.IO) {
+            var cacheNeedsUpdate = false
+
+            // Sort the background queue so the series at the top of the screen load first!
+            val sortedList = when (sortType) {
+                SortType.NAME_ASC -> listToProcess.sortedBy { it.title.lowercase() }
+                SortType.NAME_DESC -> listToProcess.sortedByDescending { it.title.lowercase() }
+                SortType.DATE_DESC -> listToProcess.sortedByDescending { it.downloadTimestamp }
+                SortType.DATE_ASC -> listToProcess.sortedBy { it.downloadTimestamp }
+            }
+
+            for (manga in sortedList) {
+                if (manga.coverUri == null) {
+                    val newCover = FileUtils.fetchCoverImage(context, manga)
+                    if (newCover != null) {
+                        // Push UI update to Main Thread using the absolute latest list state
+                        withContext(Dispatchers.Main) {
+                            val index = mangaList.indexOfFirst { it.folderUri == manga.folderUri }
+                            if (index != -1) {
+                                val updatedList = mangaList.toMutableList()
+                                updatedList[index] = updatedList[index].copy(coverUri = newCover)
+                                mangaList = updatedList
+                            }
+                        }
+                        cacheNeedsUpdate = true
+                    }
+                }
+            }
+
+            if (cacheNeedsUpdate) {
+                // Save the finalized list to cache
+                FileUtils.updateCacheFile(context, rootFolderUri, mangaList)
+            }
+        }
+    }
+
     // JSON Startup Cache Hook
     LaunchedEffect(rootFolderUri) {
         isSyncing = true
-        withContext(Dispatchers.IO) {
+        val loadedList = withContext(Dispatchers.IO) {
             val cached = FileUtils.getCachedLibrary(context, rootFolderUri)
-            if (cached.isNotEmpty()) {
-                mangaList = cached
-            } else {
-                mangaList = FileUtils.syncLibrary(context, rootFolderUri)
-            }
+            if (cached.isNotEmpty()) cached else FileUtils.syncLibrary(context, rootFolderUri)
         }
+        mangaList = loadedList
         isSyncing = false
+
+        // Trigger lazy loading
+        processMissingCovers(loadedList)
     }
 
-    // NEW: Auto-refresh hook that listens to the background scraper!
+    // Auto-refresh hook that listens to the background scraper
     val isScraping by app.mangareader.mobile.ScrapeState.isScraping.collectAsState()
+    var previousIsScraping by remember { mutableStateOf(isScraping) }
+
     LaunchedEffect(isScraping) {
-        if (!isScraping) {
-            withContext(Dispatchers.IO) {
-                val cached = FileUtils.getCachedLibrary(context, rootFolderUri)
-                if (cached.isNotEmpty()) {
-                    mangaList = cached
-                }
+        // ONLY trigger if scraping was true and is now false (finished)
+        if (previousIsScraping && !isScraping) {
+            val cached = withContext(Dispatchers.IO) { FileUtils.getCachedLibrary(context, rootFolderUri) }
+            if (cached.isNotEmpty()) {
+                mangaList = cached
+                processMissingCovers(cached)
             }
         }
+        previousIsScraping = isScraping
     }
 
     val filteredList by remember {
@@ -139,10 +180,12 @@ fun HomeScreen(
                                     text = { Text("Resync Files") },
                                     onClick = {
                                         isMenuExpanded = false
-                                        scope.launch(Dispatchers.IO) {
+                                        scope.launch {
                                             isSyncing = true
-                                            mangaList = FileUtils.syncLibrary(context, rootFolderUri)
+                                            val newList = withContext(Dispatchers.IO) { FileUtils.syncLibrary(context, rootFolderUri) }
+                                            mangaList = newList
                                             isSyncing = false
+                                            processMissingCovers(newList)
                                         }
                                         onResyncClick()
                                     },
