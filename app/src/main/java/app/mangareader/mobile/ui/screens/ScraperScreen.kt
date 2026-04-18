@@ -9,6 +9,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.BackHandler // NEW: Imported for swipe gestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -40,6 +41,9 @@ private val PurpleEnd = Color(0xFF311545)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ScraperScreen(onBackClick: () -> Unit) {
+    // NEW: Intercepts the Android system edge-swipe gesture to navigate back properly
+    BackHandler { onBackClick() }
+
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("manga_prefs", Context.MODE_PRIVATE) }
 
@@ -48,11 +52,11 @@ fun ScraperScreen(onBackClick: () -> Unit) {
     val outputUri by ScrapeState.outputDirectoryUri.collectAsState()
     val conflictFolder by ScrapeState.showConflictDialog.collectAsState()
 
-    var url by remember { mutableStateOf("https://www.mangago.me/read-manga/threads_of_love/") }
-    var seriesTitle by remember { mutableStateOf("") }
-    var startChapter by remember { mutableStateOf("1") }
-    var baseChapterName by remember { mutableStateOf("") } // NEW: Base Chapter Offset Name
-    var maxChapters by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf(prefs.getString("last_url", "https://www.mangago.me/read-manga/threads_of_love/") ?: "") }
+    var seriesTitle by remember { mutableStateOf(prefs.getString("last_title", "") ?: "") }
+    var startChapter by remember { mutableStateOf(prefs.getString("last_start_chapter", "1") ?: "1") }
+    var baseChapterName by remember { mutableStateOf(prefs.getString("last_base_chapter", "") ?: "") }
+    var maxChapters by remember { mutableStateOf(prefs.getString("last_max_chapters", "") ?: "") }
     var showLoginDialog by remember { mutableStateOf(false) }
     var currentDialogUrl by remember { mutableStateOf("") }
     var showStartWarning by remember { mutableStateOf(false) }
@@ -70,8 +74,16 @@ fun ScraperScreen(onBackClick: () -> Unit) {
         ScrapeState.isPaused.value = false
         ScrapeState.isCancelled.value = false
 
-        // FIX 5: We no longer pass large or secure cookies via Intents.
-        // The Service now pulls it straight from SharedPreferences/CookieManager.
+        // NEW: Save the user's input fields so they persist for the next time
+        prefs.edit()
+            .putString("last_url", url)
+            .putString("last_title", seriesTitle)
+            .putString("last_start_chapter", startChapter)
+            .putString("last_base_chapter", baseChapterName)
+            .putString("last_max_chapters", maxChapters)
+            .apply()
+
+        // NEW: Removed passing cookies via Intent to avoid TransactionTooLargeException
         val serviceIntent = Intent(context, ScraperService::class.java).apply {
             putExtra("URL", url)
             putExtra("SERIES_TITLE", seriesTitle.trim())
@@ -259,7 +271,7 @@ fun ScraperScreen(onBackClick: () -> Unit) {
                 Button(onClick = {
                     val cookies = CookieManager.getInstance().getCookie("https://www.mangago.me")
                     if (!cookies.isNullOrEmpty()) {
-                        // FIX 5: Save securely locally to make sure Service finds it
+                        // NEW: Save securely to SharedPreferences and clear memory
                         prefs.edit().putString("saved_cookie", cookies).apply()
                         CookieManager.getInstance().flush()
                     }

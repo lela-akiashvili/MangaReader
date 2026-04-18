@@ -1,6 +1,7 @@
 package app.mangareader.mobile.ui.screens
 
 import android.content.Context
+import androidx.activity.compose.BackHandler // NEW: Imported for swipe gestures
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
@@ -47,6 +48,9 @@ fun ReaderScreen(
     seriesFile: DocumentFile,
     onBackClick: () -> Unit
 ) {
+    // NEW: Intercepts the Android system edge-swipe gesture to navigate back properly
+    BackHandler { onBackClick() }
+
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("manga_progress", Context.MODE_PRIVATE) }
@@ -72,7 +76,6 @@ fun ReaderScreen(
     LaunchedEffect(seriesFile) {
         isLoading = true
 
-        // 1. Fetch chapters on the IO thread to prevent UI freezing!
         val chapters = withContext(Dispatchers.IO) { FileUtils.getChapters(context, seriesFile) }
         allChapters = chapters
 
@@ -87,10 +90,8 @@ fun ReaderScreen(
         currentBaseChapter = savedChapter
         displayImages = ChapterCacheManager.preloadChapters(context, seriesTitle, chapters, savedChapter)
 
-        // FIX: Set loading to false FIRST so LazyColumn enters the composition tree
         isLoading = false
 
-        // FIX: Launch the scrolling in a new coroutine so it doesn't block the state update
         launch {
             if (displayImages.isNotEmpty()) {
                 val targetAbsoluteIndex = displayImages.indexOfFirst {
@@ -203,7 +204,6 @@ fun ReaderScreen(
                                                 currentBaseChapter = index
                                                 displayImages = ChapterCacheManager.preloadChapters(context, seriesTitle, allChapters, currentBaseChapter)
 
-                                                // FIX: Allow UI to compose before scrolling
                                                 isLoading = false
 
                                                 launch {
