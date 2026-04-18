@@ -1,6 +1,7 @@
 package app.mangareader.mobile.ui.screens
 
 import androidx.compose.ui.unit.sp
+import android.content.Context
 import android.content.Intent
 import android.webkit.CookieManager
 import android.webkit.WebView
@@ -40,6 +41,8 @@ private val PurpleEnd = Color(0xFF311545)
 @Composable
 fun ScraperScreen(onBackClick: () -> Unit) {
     val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("manga_prefs", Context.MODE_PRIVATE) }
+
     val isScraping by ScrapeState.isScraping.collectAsState()
     val logs by ScrapeState.logs.collectAsState()
     val outputUri by ScrapeState.outputDirectoryUri.collectAsState()
@@ -53,7 +56,6 @@ fun ScraperScreen(onBackClick: () -> Unit) {
     var showLoginDialog by remember { mutableStateOf(false) }
     var currentDialogUrl by remember { mutableStateOf("") }
     var showStartWarning by remember { mutableStateOf(false) }
-    var validCookie by remember { mutableStateOf("") }
 
     val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -67,13 +69,15 @@ fun ScraperScreen(onBackClick: () -> Unit) {
     fun startScraping() {
         ScrapeState.isPaused.value = false
         ScrapeState.isCancelled.value = false
+
+        // FIX 5: We no longer pass large or secure cookies via Intents.
+        // The Service now pulls it straight from SharedPreferences/CookieManager.
         val serviceIntent = Intent(context, ScraperService::class.java).apply {
             putExtra("URL", url)
             putExtra("SERIES_TITLE", seriesTitle.trim())
             putExtra("START_CHAPTER", startChapter.toIntOrNull() ?: 1)
             putExtra("BASE_CHAPTER", baseChapterName.toIntOrNull() ?: startChapter.toIntOrNull() ?: 1)
             putExtra("MAX_CHAPTERS", maxChapters.toIntOrNull() ?: 99999)
-            putExtra("COOKIE", validCookie)
         }
         ContextCompat.startForegroundService(context, serviceIntent)
     }
@@ -128,7 +132,6 @@ fun ScraperScreen(onBackClick: () -> Unit) {
                     modifier = Modifier.weight(1f),
                     enabled = !isScraping
                 )
-                // NEW INPUT: Decouples Start Index from Output Folder Name
                 OutlinedTextField(
                     value = baseChapterName, onValueChange = { baseChapterName = it },
                     label = { Text("Base Number") },
@@ -255,7 +258,11 @@ fun ScraperScreen(onBackClick: () -> Unit) {
             confirmButton = {
                 Button(onClick = {
                     val cookies = CookieManager.getInstance().getCookie("https://www.mangago.me")
-                    if (!cookies.isNullOrEmpty()) validCookie = cookies
+                    if (!cookies.isNullOrEmpty()) {
+                        // FIX 5: Save securely locally to make sure Service finds it
+                        prefs.edit().putString("saved_cookie", cookies).apply()
+                        CookieManager.getInstance().flush()
+                    }
                     showLoginDialog = false
                     ScrapeState.log("[System] Browser closed. Cookies saved.")
                 }) { Text("Save & Close") }

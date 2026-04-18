@@ -70,7 +70,7 @@ class ScraperService : Service() {
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
 
-                // Massive 4K Viewport to Guarantee Highest Res Canvas captures
+                // Massive 4K Viewport to Guarantee Highest Res Canvas captures (Untouched as requested)
                 layoutParams = ViewGroup.LayoutParams(2560, 3500)
                 measure(
                     View.MeasureSpec.makeMeasureSpec(2560, View.MeasureSpec.EXACTLY),
@@ -97,7 +97,6 @@ class ScraperService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val seriesUrl = intent?.getStringExtra("URL") ?: return START_NOT_STICKY
         val seriesTitle = intent.getStringExtra("SERIES_TITLE") ?: ""
-        val manualCookie = intent.getStringExtra("COOKIE") ?: ""
         val startChap = intent.getIntExtra("START_CHAPTER", 1)
         val baseChap = intent.getIntExtra("BASE_CHAPTER", startChap) // Decouples UI iteration from File Numbering
         val maxChaps = intent.getIntExtra("MAX_CHAPTERS", 99999)
@@ -108,7 +107,7 @@ class ScraperService : Service() {
 
         serviceScope.launch {
             try {
-                scrapeSeries(seriesUrl, seriesTitle, manualCookie, startChap, baseChap, maxChaps)
+                scrapeSeries(seriesUrl, seriesTitle, startChap, baseChap, maxChaps)
             } catch (e: Exception) {
                 ScrapeState.log("[Error] Critical System Failure: ${e.message}")
             } finally {
@@ -124,12 +123,15 @@ class ScraperService : Service() {
     private suspend fun scrapeSeries(
         seriesUrl: String,
         seriesTitle: String,
-        manualCookie: String,
         startChap: Int,
         baseChap: Int,
         maxChaps: Int
     ) {
+        // Securely pull cookie from global manager or SharedPreferences instead of raw Intent
+        val prefs = getSharedPreferences("manga_prefs", Context.MODE_PRIVATE)
+        val manualCookie = prefs.getString("saved_cookie", "") ?: ""
         val cookies = CookieManager.getInstance().getCookie(seriesUrl) ?: manualCookie
+
         ScrapeState.log("[System] Analyzing Series Page for chapters...")
 
         val doc = Jsoup.connect(seriesUrl)
@@ -241,8 +243,19 @@ class ScraperService : Service() {
                 if (action == null) {
                     ScrapeState.conflictResolution = CompletableDeferred()
                     ScrapeState.showConflictDialog.value = folderName
-                    action = ScrapeState.conflictResolution?.await()
+
+                    // FIX DEADLOCK: Wait up to 60 seconds for user input, otherwise default to SKIP
+                    action = withTimeoutOrNull(60_000L) {
+                        ScrapeState.conflictResolution?.await()
+                    }
+
+                    if (action == null) {
+                        ScrapeState.log("[Warn] Conflict timeout. Defaulting to SKIP.")
+                        action = ConflictAction.SKIP
+                    }
+
                     ScrapeState.conflictResolution = null
+                    ScrapeState.showConflictDialog.value = null
 
                     if (action == ConflictAction.OVERWRITE_ALL || action == ConflictAction.SKIP_ALL) {
                         applyToAllConflict = action
@@ -434,7 +447,7 @@ class ScraperService : Service() {
             }
         }
 
-        // NEW: Automatically resync the JSON library cache behind the scenes!
+        // Automatically resync the JSON library cache behind the scenes!
         if (rootUri != null) {
             ScrapeState.log("[System] Auto-syncing library cache...")
             app.mangareader.mobile.utils.FileUtils.syncLibrary(applicationContext, rootUri)
@@ -553,6 +566,11 @@ class ScraperService : Service() {
                 var stuckCounter = 0;
 
                 var scrollInterval = setInterval(function() {
+                    // FIX: Dispatch synthetic events to trick lazy-loader into firing
+                    // This jump-starts loading when the document is shorter than the 4K viewport
+                    window.dispatchEvent(new Event('scroll'));
+                    window.dispatchEvent(new Event('resize'));
+                    
                     window.scrollBy(0, window.innerHeight > 0 ? window.innerHeight * 0.8 : 1000);
                     
                     var currentScrollY = window.scrollY;
@@ -561,7 +579,10 @@ class ScraperService : Service() {
                         
                         if (stuckCounter % 2 === 0) {
                             window.scrollBy(0, -400);
-                            setTimeout(function() { window.scrollBy(0, 400); }, 150);
+                            setTimeout(function() { 
+                                window.dispatchEvent(new Event('scroll'));
+                                window.scrollBy(0, 400); 
+                            }, 150);
                         }
 
                         var loaders = document.querySelectorAll('img[src*="ajax-loader"]');
@@ -690,6 +711,23 @@ class ScraperService : Service() {
     }
 
     override fun onDestroy() {
+        // FIX 2: Cancel Zombie Coroutines so they don't leak CPU processing
+        serviceScope.cancel()
+
+        // FIX 1: Safely dismantle the heavy 4K WebView on the Main Thread
+        Handler(Looper.getMainLooper()).post {
+            try {
+                webView?.stopLoading()
+                webView?.removeAllViews()
+                webView?.clearHistory()
+                webView?.destroy()
+                webView = null
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        // FIX 4: Guarantee WakeLock is released
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
