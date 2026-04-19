@@ -566,8 +566,7 @@ class ScraperService : Service() {
                 var stuckCounter = 0;
 
                 var scrollInterval = setInterval(function() {
-                    // FIX: Dispatch synthetic events to trick lazy-loader into firing
-                    // This jump-starts loading when the document is shorter than the 4K viewport
+                    // Dispatch synthetic events to trick lazy-loader into firing
                     window.dispatchEvent(new Event('scroll'));
                     window.dispatchEvent(new Event('resize'));
                     
@@ -585,6 +584,7 @@ class ScraperService : Service() {
                             }, 150);
                         }
 
+                        // Parse the current DOM to see what we actually have right now
                         var loaders = document.querySelectorAll('img[src*="ajax-loader"]');
                         var isLoaded = true;
                         for(var i=0; i<loaders.length; i++) {
@@ -601,9 +601,26 @@ class ScraperService : Service() {
                             if (src.indexOf('ajax-loader') === -1) validCount++;
                         }
 
-                        var conditionMet = (isLoaded && stuckCounter >= 5) || (expectedTotal > 0 && validCount >= expectedTotal);
+                        // NEW: Strict Expected Total logic implementation
+                        var conditionMet = false;
+                        if (expectedTotal > 0) {
+                            // If we parsed the total correctly, stubbornly wait for all images
+                            // and completely ignore the soft 'stuckCounter' exit.
+                            if (validCount >= expectedTotal) {
+                                conditionMet = true;
+                            }
+                        } else {
+                            // Fallback: If we couldn't parse the total, rely on the stuck counter
+                            if (isLoaded && stuckCounter >= 5) {
+                                conditionMet = true;
+                            }
+                        }
                         
-                        if (conditionMet || stuckCounter >= 15) {
+                        // Hard Exit: If we are completely deadlocked for ~32 seconds without scrolling,
+                        // force exit to prevent an infinite background loop.
+                        var hardExit = (stuckCounter >= 40);
+                        
+                        if (conditionMet || hardExit) {
                             clearInterval(scrollInterval);
                             clearTimeout(safetyTimeout);
                             extractImages();
@@ -711,10 +728,8 @@ class ScraperService : Service() {
     }
 
     override fun onDestroy() {
-        // FIX 2: Cancel Zombie Coroutines so they don't leak CPU processing
         serviceScope.cancel()
 
-        // FIX 1: Safely dismantle the heavy 4K WebView on the Main Thread
         Handler(Looper.getMainLooper()).post {
             try {
                 webView?.stopLoading()
@@ -727,7 +742,6 @@ class ScraperService : Service() {
             }
         }
 
-        // FIX 4: Guarantee WakeLock is released
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
