@@ -1,7 +1,7 @@
 package app.mangareader.mobile.ui.screens
 
 import android.content.Context
-import androidx.activity.compose.BackHandler // NEW: Imported for swipe gestures
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView // NEW: Imported to access the Android View
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -36,6 +37,7 @@ import app.mangareader.mobile.utils.ChapterCacheManager
 import app.mangareader.mobile.utils.FileUtils
 import app.mangareader.mobile.ui.components.ZoomableContainer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -48,10 +50,10 @@ fun ReaderScreen(
     seriesFile: DocumentFile,
     onBackClick: () -> Unit
 ) {
-    // NEW: Intercepts the Android system edge-swipe gesture to navigate back properly
     BackHandler { onBackClick() }
 
     val context = LocalContext.current
+    val view = LocalView.current
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("manga_progress", Context.MODE_PRIVATE) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -65,7 +67,16 @@ fun ReaderScreen(
     var isZoomedIn by remember { mutableStateOf(false) }
     var isChapterMenuExpanded by remember { mutableStateOf(false) }
 
+    var keepAwake by remember { mutableStateOf(true) }
+
     val listState = rememberLazyListState()
+
+    DisposableEffect(keepAwake) {
+        view.keepScreenOn = keepAwake
+        onDispose {
+            view.keepScreenOn = false
+        }
+    }
 
     LaunchedEffect(Unit) {
         ScrapeState.latestDownload.collect { message ->
@@ -103,6 +114,12 @@ fun ReaderScreen(
     }
 
     val firstVisibleIndex by remember { derivedStateOf { listState.firstVisibleItemIndex } }
+
+    LaunchedEffect(firstVisibleIndex, areBarsVisible, isZoomedIn) {
+        keepAwake = true
+        delay(10 * 60 * 1000L)
+        keepAwake = false
+    }
 
     LaunchedEffect(firstVisibleIndex) {
         if (displayImages.isNotEmpty() && !isLoading) {
