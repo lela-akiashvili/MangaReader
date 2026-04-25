@@ -27,15 +27,14 @@ object ChapterCacheManager {
         context: Context,
         seriesTitle: String,
         allChapters: List<MangaChapter>,
-        currentIndex: Int
+        activeIndices: List<Int> // CHANGED: Now accepts a dynamic list of chapters to keep alive
     ): List<ReaderImage> = withContext(Dispatchers.IO) {
 
         val safeTitle = seriesTitle.replace(Regex("[^a-zA-Z0-9.-]"), "_")
         val cacheRoot = File(context.cacheDir, "manga_cache/$safeTitle")
         if (!cacheRoot.exists()) cacheRoot.mkdirs()
 
-        // Clean up distant chapters
-        val activeIndices = listOf(currentIndex - 1, currentIndex, currentIndex + 1)
+        // Clean up distant chapters not in the active list
         cacheRoot.listFiles()?.forEach { folder ->
             val idx = folder.name.substringAfter("chap_").toIntOrNull()
             if (idx == null || idx !in activeIndices) folder.deleteRecursively()
