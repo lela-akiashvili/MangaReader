@@ -32,6 +32,9 @@ import app.mangareader.mobile.utils.FileUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import android.widget.Toast
 
 private val DarkBlueStart = Color(0xFF0B101E)
 private val PurpleEnd = Color(0xFF311545)
@@ -66,6 +69,9 @@ fun HomeScreen(
     var validCookie by remember { mutableStateOf("") }
     var isBrowserVisible by remember { mutableStateOf(false) }
     var isMenuExpanded by remember { mutableStateOf(false) }
+
+    var seriesToBind by remember { mutableStateOf<MangaSeries?>(null) }
+    var inputUrl by remember { mutableStateOf("") }
 
     val headerFooterGradient = Brush.horizontalGradient(colors = listOf(DarkBlueStart, PurpleEnd))
 
@@ -251,15 +257,69 @@ fun HomeScreen(
                 modifier = Modifier.fillMaxSize()
             ) {
                 items(filteredList, key = { it.folderUri.toString() }) { manga ->
-                    MangaCard(manga = manga, onClick = { onSeriesClick(manga) })
+                    MangaCard(
+                        manga = manga,
+                        onClick = { onSeriesClick(manga) },
+                        onLongClick = {
+                            seriesToBind = manga
+                            inputUrl = ""
+                        }
+                    )
                 }
+            }
+
+            if (seriesToBind != null) {
+                AlertDialog(
+                    onDismissRequest = { seriesToBind = null },
+                    title = { Text("Bind Mangago URL", color = Color.White) },
+                    text = {
+                        Column {
+                            Text("Link a URL to '${seriesToBind?.title}' so the auto-tracker always finds it.", color = Color.LightGray, fontSize = 14.sp)
+                            Spacer(modifier = Modifier.height(12.dp))
+                            OutlinedTextField(
+                                value = inputUrl,
+                                onValueChange = { inputUrl = it },
+                                label = { Text("Mangago Series URL") },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                colors = TextFieldDefaults.colors(
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White,
+                                    focusedContainerColor = Color.Transparent,
+                                    unfocusedContainerColor = Color.Transparent
+                                )
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            val title = seriesToBind?.title ?: ""
+                            if (title.isNotEmpty() && inputUrl.isNotEmpty()) {
+                                scope.launch(Dispatchers.IO) {
+                                    FileUtils.bindUrlToTracker(context, rootFolderUri, title, inputUrl)
+                                    withContext(Dispatchers.Main) {
+                                        Toast.makeText(context, "URL Bound Successfully!", Toast.LENGTH_SHORT).show()
+                                        seriesToBind = null
+                                    }
+                                }
+                            }
+                        }) {
+                            Text("Save Link")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { seriesToBind = null }) { Text("Cancel", color = Color.White) }
+                    },
+                    containerColor = Color(0xFF1E1E1E)
+                )
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun MangaCard(manga: MangaSeries, onClick: () -> Unit) {
+fun MangaCard(manga: MangaSeries, onClick: () -> Unit, onLongClick: () -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("manga_progress", Context.MODE_PRIVATE) }
     var lastChapter by remember { mutableIntStateOf(0) }
@@ -268,10 +328,15 @@ fun MangaCard(manga: MangaSeries, onClick: () -> Unit) {
         lastChapter = prefs.getInt("last_chapter_${manga.title}", 0) + 1
     }
 
-    // REMOVED: The prefs.edit() line from here!
-
     Box(
-        modifier = Modifier.width(110.dp).height(160.dp).clip(RoundedCornerShape(8.dp)).clickable { onClick() }
+        modifier = Modifier
+            .width(110.dp)
+            .height(160.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
     ) {
         if (manga.coverUri != null) {
             AsyncImage(model = manga.coverUri, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())

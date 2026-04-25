@@ -17,6 +17,14 @@ import java.io.FileOutputStream
 import java.util.zip.ZipInputStream
 import org.apache.commons.compress.archivers.zip.ZipFile as CommonsZipFile
 
+// NEW: Data class for our permanent USB Tracker
+data class MangaTrackerEntry(
+    val title: String,
+    var url: String,
+    var lastChapterName: String,
+    var lastChapterNumber: Int
+)
+
 object FileUtils {
 
     /**
@@ -79,6 +87,10 @@ object FileUtils {
         }
     }
 
+    /**
+     * High-speed sync for massive USB drives (400+ series).
+     * Uses Fast-Sync logic: Indices first, generates covers on-demand or in background.
+     */
     fun syncLibrary(context: Context, rootUri: Uri): List<MangaSeries> {
         val list = mutableListOf<MangaSeries>()
 
@@ -86,11 +98,14 @@ object FileUtils {
         val children = queryChildren(context, rootUri)
 
         children.forEach { (uri, name) ->
-            val isZip = name.endsWith(".zip", ignoreCase = true)
-            val cleanTitle = if (isZip) name.dropLast(4) else name
+
+            // NEW: Explicitly ignore our JSON tracker files so they don't show up on the Home Screen!
+            if (name.endsWith(".json", ignoreCase = true)) return@forEach
+
+            val isZip = name.endsWith(".zip", ignoreCase = true) || name.endsWith(".cbz", ignoreCase = true)
+            val cleanTitle = if (isZip) name.substringBeforeLast(".") else name
 
             // Optimization: Don't fetch covers during the initial heavy loop.
-            // This is what causes the "30 minute hang" on large drives.
             list.add(MangaSeries(
                 title = cleanTitle,
                 folderUri = uri,
@@ -100,9 +115,13 @@ object FileUtils {
         }
 
         updateCacheFile(context, rootUri, list)
+        initializeTrackerIfMissing(context, rootUri, list)
         return list
     }
 
+    /**
+     * Updates the local JSON cache file for a specific drive.
+     */
     fun updateCacheFile(context: Context, rootUri: Uri, list: List<MangaSeries>) {
         try {
             val cacheList = list.map { MangaSeriesCache(it.title, it.folderUri.toString(), it.downloadTimestamp, it.coverUri?.toString()) }
@@ -111,6 +130,10 @@ object FileUtils {
         } catch (e: Exception) {}
     }
 
+    /**
+     * Background Cover Fetcher logic:
+     * Extracts the first image it finds within a series folder or ZIP.
+     */
     fun fetchCoverImage(context: Context, series: MangaSeries): Uri? {
         val seriesFile = series.documentFile ?: return null
         val cacheFile = File(context.cacheDir, "cover_${series.title.hashCode()}.jpg")
@@ -193,5 +216,98 @@ object FileUtils {
         val lower = name.lowercase()
         return lower.endsWith(".jpg") || lower.endsWith(".png") || lower.endsWith(".webp") ||
                 lower.endsWith(".jpeg") || lower.endsWith(".avif")
+    }
+
+    // --- NEW TRACKER LOGIC ---
+
+    fun getTracker(context: Context, rootUri: Uri): MutableList<MangaTrackerEntry> {
+        val rootDoc = DocumentFile.fromTreeUri(context, rootUri) ?: return mutableListOf()
+        val trackerFile = rootDoc.findFile("manga_tracker.json") ?: return mutableListOf()
+        return try {
+            val json = context.contentResolver.openInputStream(trackerFile.uri)?.bufferedReader()?.use { it.readText() } ?: "[]"
+            val type = object : TypeToken<MutableList<MangaTrackerEntry>>() {}.type
+            Gson().fromJson(json, type) ?: mutableListOf()
+        } catch (e: Exception) {
+            mutableListOf()
+        }
+    }
+
+    fun saveTracker(context: Context, rootUri: Uri, trackerList: List<MangaTrackerEntry>) {
+        val rootDoc = DocumentFile.fromTreeUri(context, rootUri) ?: return
+        var trackerFile = rootDoc.findFile("manga_tracker.json")
+        if (trackerFile == null) {
+            trackerFile = rootDoc.createFile("application/json", "manga_tracker.json")
+        }
+        try {
+            trackerFile?.uri?.let { uri ->
+                context.contentResolver.openOutputStream(uri, "wt")?.use {
+                    it.write(Gson().toJson(trackerList).toByteArray())
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun initializeTrackerIfMissing(context: Context, rootUri: Uri, library: List<MangaSeries>) {
+        val rootDoc = DocumentFile.fromTreeUri(context, rootUri) ?: return
+        if (rootDoc.findFile("manga_tracker.json") != null) return // Only run if it doesn't exist
+
+        val trackerList = mutableListOf<MangaTrackerEntry>()
+        for (series in library) {
+            if (series.documentFile == null) continue
+            val chapters = getChapters(context, series.documentFile)
+            if (chapters.isNotEmpty()) {
+                val highestChap = chapters.last()
+                val nameRaw = highestChap.name
+
+                var exactLocalName = nameRaw
+                if (exactLocalName.contains("-")) {
+                    exactLocalName = exactLocalName.substringAfter("-").trim()
+                }
+                exactLocalName = exactLocalName.substringBeforeLast(".").trim()
+
+                val localNumMatch = Regex("\\d+").find(nameRaw)
+                val chapterNumber = localNumMatch?.value?.toIntOrNull() ?: 1
+
+                trackerList.add(MangaTrackerEntry(
+                    title = series.title,
+                    url = "", // Will be filled naturally when worker checks it
+                    lastChapterName = exactLocalName,
+                    lastChapterNumber = chapterNumber
+                ))
+            }
+        }
+        saveTracker(context, rootUri, trackerList)
+    }
+
+    fun updateTrackerEntry(context: Context, rootUri: Uri, title: String, url: String, chapterName: String, chapterNumber: Int) {
+        val tracker = getTracker(context, rootUri)
+        val existing = tracker.find { it.title.equals(title, ignoreCase = true) }
+
+        if (existing != null) {
+            // Only update if the chapter number is higher
+            if (chapterNumber >= existing.lastChapterNumber) {
+                existing.lastChapterName = chapterName
+                existing.lastChapterNumber = chapterNumber
+                if (url.isNotEmpty()) existing.url = url
+            }
+        } else {
+            tracker.add(MangaTrackerEntry(title, url, chapterName, chapterNumber))
+        }
+        saveTracker(context, rootUri, tracker)
+    }
+
+    fun bindUrlToTracker(context: Context, rootUri: Uri, title: String, url: String) {
+        val tracker = getTracker(context, rootUri)
+        val existing = tracker.find { it.title.equals(title, ignoreCase = true) }
+
+        if (existing != null) {
+            existing.url = url
+        } else {
+            // Fallback: If it somehow doesn't exist yet, create a blank entry with the URL
+            tracker.add(MangaTrackerEntry(title, url, "", 0))
+        }
+        saveTracker(context, rootUri, tracker)
     }
 }

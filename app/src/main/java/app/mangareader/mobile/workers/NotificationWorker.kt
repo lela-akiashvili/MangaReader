@@ -8,6 +8,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
+import androidx.documentfile.provider.DocumentFile
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import app.mangareader.mobile.MainActivity
@@ -46,6 +47,7 @@ class NotificationWorker(
                 return@withContext Result.failure()
             }
             val rootUri = Uri.parse(rootUriStr)
+            val rootDoc = DocumentFile.fromTreeUri(context, rootUri)
 
             setStatus("Connecting to Mangago Notification Center...")
             val doc = Jsoup.connect("https://www.mangago.me/home/notification/")
@@ -62,23 +64,17 @@ class NotificationWorker(
             val updateNodes = doc.select("div.notification-wrapper.message")
 
             var highestTimestampOnPage = 0L
-            for (node in updateNodes) {
-                val messageText = node.select("div.notice-message").text()
-                if (messageText.contains("Manga have new update", ignoreCase = true)) {
-                    val timestamp = node.attr("_t").toLongOrNull() ?: 0L
-                    if (timestamp > highestTimestampOnPage) {
-                        highestTimestampOnPage = timestamp
-                    }
-                }
-            }
-
-            var highestTimestampFound = lastProcessedTimestamp
             val updatedUrls = mutableSetOf<String>()
+            val urlToNoticeTime = mutableMapOf<String, Long>()
 
             for (node in updateNodes) {
                 val messageText = node.select("div.notice-message").text()
                 if (messageText.contains("Manga have new update", ignoreCase = true)) {
                     val timestamp = node.attr("_t").toLongOrNull() ?: continue
+
+                    if (timestamp > highestTimestampOnPage) {
+                        highestTimestampOnPage = timestamp
+                    }
 
                     val shouldProcess = if (isFirstRun) {
                         timestamp == highestTimestampOnPage
@@ -87,29 +83,55 @@ class NotificationWorker(
                     }
 
                     if (shouldProcess) {
-                        if (timestamp > highestTimestampFound) {
-                            highestTimestampFound = timestamp
-                        }
                         val links = node.select("div.summary-hidden a")
                         for (link in links) {
                             val href = link.attr("href")
-                            if (href.isNotBlank()) updatedUrls.add(href)
+                            if (href.isNotBlank()) {
+                                updatedUrls.add(href)
+
+                                val existing = urlToNoticeTime[href]
+                                if (existing == null || timestamp < existing) {
+                                    urlToNoticeTime[href] = timestamp
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            setStatus("Saving baseline timestamp: ${maxOf(highestTimestampFound, highestTimestampOnPage)}")
-            prefs.edit().putLong("last_notification_timestamp", maxOf(highestTimestampFound, highestTimestampOnPage)).apply()
+            // NEW PORTABLE LOGIC: Read from 'pending_updates.json' on the USB Drive!
+            var oldLogJson = "[]"
+            try {
+                val pendingFile = rootDoc?.findFile("pending_updates.json")
+                if (pendingFile != null) {
+                    oldLogJson = context.contentResolver.openInputStream(pendingFile.uri)?.bufferedReader()?.use { it.readText() } ?: "[]"
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+
+            val oldLogArray = JSONArray(oldLogJson)
+            val existingLogsMap = mutableMapOf<String, JSONObject>()
+
+            for (i in 0 until oldLogArray.length()) {
+                val obj = oldLogArray.getJSONObject(i)
+                val url = obj.getString("url")
+                existingLogsMap[url] = obj
+
+                if (obj.optString("status") == "pending") {
+                    updatedUrls.add(url)
+                }
+            }
+
+            setStatus("Saving baseline timestamp: ${maxOf(lastProcessedTimestamp, highestTimestampOnPage)}")
+            prefs.edit().putLong("last_notification_timestamp", maxOf(lastProcessedTimestamp, highestTimestampOnPage)).apply()
 
             if (updatedUrls.isEmpty()) {
                 setStatus("No new updates found.")
                 return@withContext Result.success()
             }
 
-            setStatus("Found ${updatedUrls.size} updated series! Scanning local library...")
+            setStatus("Found ${updatedUrls.size} series to check! Scanning local library...")
             val library = FileUtils.getCachedLibrary(context, rootUri)
-            val updatesLog = JSONArray(prefs.getString("notification_log", "[]"))
+            val trackerData = FileUtils.getTracker(context, rootUri)
             var totalNewChaptersFound = 0
             var newSeriesFound = 0
 
@@ -121,51 +143,137 @@ class NotificationWorker(
                     .get()
 
                 val h1Title = seriesDoc.select("div.w-title h1").text().trim()
-                val mangagoChapters = seriesDoc.select("table#chapter_table tbody tr h4 a.chico")
-                    .map { it.text().trim() }
+                val rows = seriesDoc.select("table#chapter_table tbody tr")
+                val mangagoChapters = mutableListOf<String>()
 
+                val noticeTimestampSec = existingLogsMap[url]?.optLong("notice_time")?.takeIf { it > 0L }
+                    ?: urlToNoticeTime[url]
+                    ?: lastProcessedTimestamp
+
+                val noticeTimeMs = noticeTimestampSec * 1000L
+                val cutoffMs = noticeTimeMs - (86400000L * 1.5).toLong()
+                val dateFormat = java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.US)
+
+                var newByDateCount = 0
+
+                for (row in rows) {
+                    val titleNode = row.select("h4 a.chico")
+                    if (titleNode.isEmpty()) continue
+
+                    val chapterName = titleNode.text().trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                    mangagoChapters.add(chapterName)
+
+                    val isExplicitNew = row.select("b").text().contains("new", ignoreCase = true)
+                    val dateText = row.select("td.no").last()?.text()?.trim() ?: ""
+
+                    var isNewByDate = false
+                    try {
+                        val chapDate = dateFormat.parse(dateText)
+                        if (chapDate != null && chapDate.time >= cutoffMs) {
+                            isNewByDate = true
+                        }
+                    } catch (e: Exception) {
+                        if (dateText.contains("Today", ignoreCase = true) ||
+                            dateText.contains("Yesterday", ignoreCase = true) ||
+                            dateText.contains("ago", ignoreCase = true)) {
+                            isNewByDate = true
+                        }
+                    }
+
+                    if (isExplicitNew || isNewByDate) {
+                        newByDateCount++
+                    }
+                }
+
+                if (newByDateCount == 0 && urlToNoticeTime.containsKey(url)) {
+                    newByDateCount = 1
+                }
+
+                val trackerEntry = trackerData.find { it.title.equals(h1Title, ignoreCase = true) || it.url == url }
                 val localSeries = library.find { it.title.equals(h1Title, ignoreCase = true) }
+                val exactLocalTitle = trackerEntry?.title ?: localSeries?.title ?: h1Title
 
-                val logEntry = JSONObject()
-                logEntry.put("title", h1Title)
-                logEntry.put("url", url)
-                logEntry.put("timestamp", System.currentTimeMillis())
-                logEntry.put("status", "pending") // NEW: Mark as pending approval instead of completed
+                val isNewEntry = !existingLogsMap.containsKey(url)
+                val logEntry = existingLogsMap[url] ?: JSONObject().apply {
+                    put("url", url)
+                    put("timestamp", System.currentTimeMillis())
+                    put("type", "update")
+                    put("new_count", 0)
+                    put("last_local_name", "")
+                }
 
-                if (localSeries != null && localSeries.documentFile != null) {
+                logEntry.put("title", exactLocalTitle)
+                logEntry.put("notice_time", noticeTimestampSec)
+
+                var highestName = ""
+                var highestNumber = 0
+                var foundLocalData = false
+
+                if (trackerEntry != null) {
+                    highestName = trackerEntry.lastChapterName
+                    highestNumber = trackerEntry.lastChapterNumber
+                    foundLocalData = true
+                } else if (localSeries != null && localSeries.documentFile != null) {
                     val localChapters = FileUtils.getChapters(context, localSeries.documentFile)
-
                     if (localChapters.isNotEmpty()) {
                         val highestLocalChapter = localChapters.last()
-
-                        var exactLocalName = highestLocalChapter.name
-                        if (exactLocalName.contains("-")) {
-                            exactLocalName = exactLocalName.substringAfter("-").trim()
+                        highestName = highestLocalChapter.name
+                        if (highestName.contains("-")) {
+                            highestName = highestName.substringAfter("-").trim()
                         }
-                        exactLocalName = exactLocalName.substringBeforeLast(".").trim()
+                        highestName = highestName.substringBeforeLast(".").trim()
 
-                        val mangagoIndex = mangagoChapters.indexOfFirst {
-                            it.equals(exactLocalName, ignoreCase = true) || it.contains(exactLocalName, ignoreCase = true)
+                        val localNumMatch = Regex("\\d+").find(highestLocalChapter.name)
+                        highestNumber = localNumMatch?.value?.toIntOrNull() ?: 1
+                        foundLocalData = true
+
+                        FileUtils.updateTrackerEntry(context, rootUri, exactLocalTitle, url, highestName, highestNumber)
+                    }
+                }
+
+                if (foundLocalData) {
+                    val indexByStringMatch = mangagoChapters.indexOfFirst { onlineName ->
+                        val cleanOnline = onlineName.replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
+                        val cleanHighest = highestName.replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
+
+                        cleanOnline == cleanHighest ||
+                                (cleanHighest.isNotEmpty() && cleanOnline.contains(cleanHighest)) ||
+                                (cleanOnline.isNotEmpty() && cleanHighest.contains(cleanOnline))
+                    }
+
+                    val missingByLocalProgress = if (indexByStringMatch != -1) {
+                        indexByStringMatch
+                    } else if (highestNumber > 0) {
+                        maxOf(0, mangagoChapters.size - highestNumber)
+                    } else {
+                        0
+                    }
+
+                    val mangagoIndex = minOf(missingByLocalProgress, newByDateCount)
+
+                    if (mangagoIndex > 0) {
+                        val totalOnline = mangagoChapters.size
+                        val startChap = totalOnline - mangagoIndex + 1
+                        val baseChap = highestNumber + 1
+
+                        logEntry.put("type", "update")
+                        logEntry.put("new_count", mangagoIndex)
+                        logEntry.put("last_local_name", highestName)
+                        logEntry.put("startChap", startChap)
+                        logEntry.put("baseChap", baseChap)
+                        logEntry.put("status", "pending")
+
+                        existingLogsMap[url] = logEntry
+
+                        if (isNewEntry) totalNewChaptersFound += mangagoIndex
+                        setStatus("Logged $mangagoIndex new chapters for $exactLocalTitle.")
+                    } else {
+                        if (!isNewEntry) {
+                            logEntry.put("status", "completed")
+                            logEntry.put("new_count", 0)
+                            existingLogsMap[url] = logEntry
                         }
-
-                        if (mangagoIndex > 0) {
-                            val totalOnline = mangagoChapters.size
-                            val startChap = totalOnline - mangagoIndex + 1
-                            val localNumMatch = Regex("\\d+").find(highestLocalChapter.name)
-                            val baseChap = if (localNumMatch != null) localNumMatch.value.toInt() + 1 else startChap
-
-                            logEntry.put("type", "update")
-                            logEntry.put("new_count", mangagoIndex)
-                            logEntry.put("last_local_name", highestLocalChapter.name)
-                            logEntry.put("startChap", startChap)
-                            logEntry.put("baseChap", baseChap)
-
-                            updatesLog.put(logEntry)
-                            totalNewChaptersFound += mangagoIndex
-                            setStatus("Logged $mangagoIndex new chapters for $h1Title (Pending Approval).")
-                        } else {
-                            setStatus("$h1Title is already up to date locally.")
-                        }
+                        setStatus("$exactLocalTitle is up to date locally.")
                     }
                 } else {
                     val newCount = minOf(3, mangagoChapters.size)
@@ -176,16 +284,36 @@ class NotificationWorker(
                     logEntry.put("new_count", newCount)
                     logEntry.put("startChap", startChap)
                     logEntry.put("baseChap", startChap)
+                    logEntry.put("status", "pending")
 
-                    updatesLog.put(logEntry)
-                    newSeriesFound++
-                    setStatus("Logged new series: $h1Title (Pending Approval).")
+                    existingLogsMap[url] = logEntry
+
+                    if (isNewEntry) newSeriesFound++
+                    setStatus("Logged new series: $exactLocalTitle (Pending).")
+                }
+
+                if (ScrapeState.isCancelled.value) {
+                    setStatus("Worker aborted by user.")
+                    break
                 }
             }
 
-            prefs.edit()
-                .putString("notification_log", updatesLog.toString())
-                .apply()
+            // NEW PORTABLE LOGIC: Save the map back to the USB 'pending_updates.json'
+            val newLogArray = JSONArray()
+            existingLogsMap.values.forEach { newLogArray.put(it) }
+
+            try {
+                var outFile = rootDoc?.findFile("pending_updates.json")
+                if (outFile == null) outFile = rootDoc?.createFile("application/json", "pending_updates.json")
+                outFile?.uri?.let { uri ->
+                    context.contentResolver.openOutputStream(uri, "wt")?.use {
+                        it.write(newLogArray.toString(4).toByteArray())
+                    }
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+
+            // Cleanup the old phone memory just in case
+            prefs.edit().remove("notification_log").apply()
 
             if (totalNewChaptersFound > 0 || newSeriesFound > 0) {
                 sendSystemNotification(totalNewChaptersFound, newSeriesFound)
