@@ -51,7 +51,8 @@ fun HomeScreen(
     onThemeToggle: () -> Unit,
     isDark: Boolean,
     onResyncClick: () -> Unit,
-    onScraperClick: () -> Unit
+    onScraperClick: () -> Unit,
+    onNotificationsClick: () -> Unit // NEW: Add this to the function parameters
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -108,6 +109,10 @@ fun HomeScreen(
 
     // JSON Startup Cache Hook
     LaunchedEffect(rootFolderUri) {
+        // NEW: Save the root URI for the background worker to use!
+        val prefs = context.getSharedPreferences("manga_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putString("last_root_uri", rootFolderUri.toString()).apply()
+
         isSyncing = true
         val loadedList = withContext(Dispatchers.IO) {
             val cached = FileUtils.getCachedLibrary(context, rootFolderUri)
@@ -196,43 +201,11 @@ fun HomeScreen(
                                     onClick = { isMenuExpanded = false; onScraperClick() },
                                     leadingIcon = { Text("⚙️", fontSize = 16.sp) }
                                 )
-                            }
-                        }
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 5.dp).padding(bottom = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    TextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = { Text("Search series...", color = Color.White.copy(alpha = 0.5f)) },
-                        colors = TextFieldDefaults.colors(
-                            focusedContainerColor = Color.White.copy(alpha = 0.1f),
-                            unfocusedContainerColor = Color.White.copy(alpha = 0.1f),
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedIndicatorColor = Color.Transparent,
-                            unfocusedIndicatorColor = Color.Transparent
-                        ),
-                        modifier = Modifier.weight(1f).height(50.dp),
-                        shape = RoundedCornerShape(8.dp)
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Box {
-                        Button(
-                            onClick = { isSortMenuExpanded = true },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.1f)),
-                            modifier = Modifier.height(50.dp)
-                        ) { Text(sortType.label) }
-
-                        DropdownMenu(expanded = isSortMenuExpanded, onDismissRequest = { isSortMenuExpanded = false }) {
-                            SortType.entries.forEach { type ->
+                                // NEW: Dropdown item for the Notifications Center
                                 DropdownMenuItem(
-                                    text = { Text(type.label) },
-                                    onClick = { sortType = type; isSortMenuExpanded = false }
+                                    text = { Text("Notifications Center") },
+                                    onClick = { isMenuExpanded = false; onNotificationsClick() },
+                                    leadingIcon = { Text("🔔", fontSize = 16.sp) }
                                 )
                             }
                         }
@@ -294,6 +267,8 @@ fun MangaCard(manga: MangaSeries, onClick: () -> Unit) {
     LaunchedEffect(manga.folderUri) {
         lastChapter = prefs.getInt("last_chapter_${manga.title}", 0) + 1
     }
+
+    // REMOVED: The prefs.edit() line from here!
 
     Box(
         modifier = Modifier.width(110.dp).height(160.dp).clip(RoundedCornerShape(8.dp)).clickable { onClick() }

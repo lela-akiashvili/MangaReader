@@ -1,5 +1,12 @@
 package app.mangareader.mobile
 
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.Constraints
+import androidx.work.NetworkType
+import java.util.concurrent.TimeUnit
+import app.mangareader.mobile.workers.NotificationWorker
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -17,10 +24,27 @@ import app.mangareader.mobile.ui.screens.HomeScreen
 import app.mangareader.mobile.ui.screens.ReaderScreen
 import app.mangareader.mobile.ui.screens.ScraperScreen
 import app.mangareader.mobile.ui.screens.StartupScreen
+import app.mangareader.mobile.ui.screens.NotificationScreen // Added import for NotificationScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED) // Only run if internet is available
+            .build()
+
+        // Schedule it to run every 4 hours
+        val updateRequest = PeriodicWorkRequestBuilder<NotificationWorker>(4, TimeUnit.HOURS)
+            .setConstraints(constraints)
+            .build()
+
+        // Enqueue the worker uniquely so it doesn't accidentally run multiple overlapping timers
+        WorkManager.getInstance(applicationContext).enqueueUniquePeriodicWork(
+            "MangagoUpdateTracker",
+            ExistingPeriodicWorkPolicy.KEEP,
+            updateRequest
+        )
 
         val prefs = getSharedPreferences("manga_prefs", Context.MODE_PRIVATE)
         val savedUriString = prefs.getString("root_folder_uri", null)
@@ -81,12 +105,16 @@ class MainActivity : ComponentActivity() {
                                 onThemeToggle = { isDarkTheme = !isDarkTheme },
                                 isDark = isDarkTheme,
                                 onResyncClick = { folderPickerLauncher.launch(null) },
-                                onScraperClick = { currentScreen = "scraper" }
+                                onScraperClick = { currentScreen = "scraper" },
+                                onNotificationsClick = { currentScreen = "notifications" } // Added the missing parameter!
                             )
                         }
                     }
                     "scraper" -> {
                         ScraperScreen(onBackClick = { currentScreen = "home" })
+                    }
+                    "notifications" -> { // Added the new route to show the Notification Center!
+                        NotificationScreen(onBackClick = { currentScreen = "home" })
                     }
                     "reader" -> {
                         var finalFile = selectedSeriesFile
