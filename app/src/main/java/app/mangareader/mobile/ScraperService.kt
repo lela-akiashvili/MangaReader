@@ -511,6 +511,12 @@ class ScraperService : Service() {
                         val titleOrFallback = seriesTitle.ifBlank { "requested series" }
                         sendCompletionNotification("Scraping Complete!", "Successfully downloaded $titleOrFallback.")
                     }
+
+                    ScrapeState.outputDirectoryUri.value?.let { rootUri ->
+                        serviceScope.launch {
+                            app.mangareader.mobile.utils.SupabaseManager.autoSyncBackground(applicationContext, rootUri)
+                        }
+                    }
                 } else {
                     sendCompletionNotification("Scraping Stopped", "Download was cancelled for $seriesTitle.")
                 }

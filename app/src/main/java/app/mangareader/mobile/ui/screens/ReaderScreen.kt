@@ -1,10 +1,15 @@
 package app.mangareader.mobile.ui.screens
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -20,6 +25,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -376,12 +382,8 @@ fun ReaderScreen(
                         ) { areBarsVisible = !areBarsVisible }
                     ) {
                         items(displayImages, key = { it.uri.toString() }) { readerImg ->
-                            AsyncImage(
-                                model = readerImg.uri,
-                                contentDescription = null,
-                                modifier = Modifier.fillMaxWidth(),
-                                contentScale = ContentScale.FillWidth
-                            )
+                            // Replaced AsyncImage with our native Subsampling handler
+                            AdaptiveWebtoonImage(uri = readerImg.uri)
                         }
 
                         item {
@@ -411,6 +413,117 @@ fun ReaderScreen(
                         color = Color(0xFFFCDC2A)
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun AdaptiveWebtoonImage(uri: Uri) {
+    val context = LocalContext.current
+    var imageChunks by remember { mutableStateOf<List<android.graphics.Rect>?>(null) }
+    var originalSize by remember { mutableStateOf(Pair(0, 0)) }
+
+    // 1. Instantly read dimensions without loading into RAM
+    LaunchedEffect(uri) {
+        withContext(Dispatchers.IO) {
+            try {
+                val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream, null, options)
+                }
+                val height = options.outHeight
+                val width = options.outWidth
+                originalSize = Pair(width, height)
+
+                // Hardware texture limit is ~8192 on most phones.
+                // We slice if height is > 4000 to be perfectly safe and memory efficient.
+                if (height > 4000) {
+                    val chunks = mutableListOf<android.graphics.Rect>()
+                    var top = 0
+                    while (top < height) {
+                        val bottom = (top + 4000).coerceAtMost(height)
+                        chunks.add(android.graphics.Rect(0, top, width, bottom))
+                        top += 4000
+                    }
+                    imageChunks = chunks
+                } else {
+                    imageChunks = emptyList() // Normal size
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                imageChunks = emptyList() // Fallback to normal loading if bounds fail
+            }
+        }
+    }
+
+    if (imageChunks == null) {
+        Box(modifier = Modifier.fillMaxWidth().height(400.dp), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(color = Color(0xFFFCDC2A))
+        }
+    } else if (imageChunks!!.isEmpty()) {
+        // Normal Image - Coil handles it perfectly
+        AsyncImage(
+            model = uri,
+            contentDescription = null,
+            modifier = Modifier.fillMaxWidth(),
+            contentScale = ContentScale.FillWidth
+        )
+    } else {
+        // Massive Image - Sub-sample chunks natively!
+        Column(modifier = Modifier.fillMaxWidth()) {
+            imageChunks!!.forEach { rect ->
+                ChunkRenderer(uri = uri, rect = rect, width = originalSize.first)
+            }
+        }
+    }
+}
+
+@Composable
+fun ChunkRenderer(uri: Uri, rect: android.graphics.Rect, width: Int) {
+    val context = LocalContext.current
+    var bitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    val aspectRatio = width.toFloat() / rect.height().toFloat()
+
+    LaunchedEffect(uri, rect) {
+        withContext(Dispatchers.IO) {
+            try {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    val decoder = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                        BitmapRegionDecoder.newInstance(stream)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        BitmapRegionDecoder.newInstance(stream, false)
+                    }
+                    decoder?.let {
+                        val options = BitmapFactory.Options().apply {
+                            inPreferredConfig = Bitmap.Config.ARGB_8888
+                        }
+                        val bmp = it.decodeRegion(rect, options)
+                        it.recycle()
+                        withContext(Dispatchers.Main) {
+                            bitmap = bmp?.asImageBitmap()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxWidth().aspectRatio(aspectRatio)) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.FillWidth
+            )
+        } else {
+            // Faint loading indicator for the specific chunk
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = Color.LightGray, strokeWidth = 2.dp)
             }
         }
     }
