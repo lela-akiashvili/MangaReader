@@ -24,3 +24,7 @@ dependencyResolutionManagement {
 
 rootProject.name = "MangaReader"
 include(":app")
+include(":core:designsystem")
+include(":domain")
+include(":data")
+include(":data")
